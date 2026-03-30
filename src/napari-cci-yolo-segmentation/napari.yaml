@@ -1,0 +1,15 @@
+name: napari-cci-yolo-segmentation
+display_name: CCI Segmentation Plugin
+description: A napari plugin for segmenting images using YOLO.
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
+categories: ["Annotation", "Segmentation"]
+contributions:
+  commands:
+    - id: napari-cci-yolo-segmentation.make_qwidget
+      python_name: napari_cci_yolo_segmentation:CciYoloSegmentatorQWidget
+      title: CCI segmentation plugin
+  widgets:
+    - command: napari-cci-yolo-segmentation.make_qwidget
+      display_name: CCI Segmentation Plugin
