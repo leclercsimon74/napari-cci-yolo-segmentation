@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -18,6 +19,8 @@ def _load_training_module():
     spec = importlib.util.spec_from_file_location("segmentation_training", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # Ensure decorators that inspect sys.modules (e.g., dataclass) can resolve module globals.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

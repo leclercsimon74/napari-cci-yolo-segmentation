@@ -24,6 +24,8 @@ jobs:
     name: ${{ matrix.os }} • py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
 
     strategy:
       fail-fast: false
@@ -59,11 +61,11 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           QT_QUICK_BACKEND: software
           NAPARI_TESTING: "1"
-        run: xvfb-run --auto-servernum python -m pytest tests/ -v
+        run: xvfb-run --auto-servernum python -m pytest tests/ -v -p no:pytestqt
 
       - name: Run tests (Windows / macOS)
         if: runner.os != 'Linux'
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -v -p no:pytestqt
 
   deploy:
     needs: [test]
