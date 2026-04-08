@@ -24,6 +24,48 @@ pip install git+https://github.com/CCI-GU-Sweden/napari-cci-yolo-segmentation.gi
 pip install -e .
 ```
 
+### Recommended Windows Setup (Conda)
+
+`environment.yml` provides the base environment (Python, numpy, napari, etc.)
+without torch — torch is installed separately so you can choose CPU or GPU.
+
+#### GPU (NVIDIA CUDA) — recommended if you have an NVIDIA GPU
+
+Check your maximum supported CUDA version first:
+```shell
+nvidia-smi
+```
+Then pick the matching wheel index below (`cu124` = CUDA 12.4, `cu126` = 12.6, etc.)
+and run:
+
+```shell
+conda env create -f environment.yml
+conda activate yolo_segmentation
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install ultralytics
+pip install -e .
+```
+
+Verify GPU is visible:
+```shell
+python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"
+```
+
+#### CPU only
+
+```shell
+conda env create -f environment.yml
+conda activate yolo_segmentation
+pip install torch torchvision
+pip install -e . --no-deps
+```
+
+Quick smoke test:
+
+```shell
+python -c "import numpy, scipy, torch, cv2; from ultralytics import YOLO; print(numpy.__version__, scipy.__version__, torch.__version__, cv2.__version__)"
+```
+
 ## Retrain Data Format
 
 The retrain folder must contain two subfolders:

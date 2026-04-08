@@ -35,15 +35,19 @@ class CCIYoloWrapper:
     def load_model(self, weights_path: Path) -> None:
         self.model = self._create_model(str(weights_path))
 
+    def model_task(self) -> str:
+        task = getattr(self.model, "task", None)
+        return str(task) if task is not None else "unknown"
+
     def predict(self, img):
-        return self.model(img)
+        return self.model.predict(source=img)
 
     def train(
         self,
         data_set_file: Path,
         image_size: int,
         batch: int = 8,
-        epochs: int = 100,
+        epochs: int = 300,
         patience: int = 30,
         **kwargs,
     ):
@@ -70,7 +74,7 @@ class RetrainConfig:
     val_ratio: float = 0.2
     seed: int = 42
     batch: int = 4
-    epochs: int = 100
+    epochs: int = 300
     patience: int = 30
 
 
@@ -124,26 +128,63 @@ def run_retraining_pipeline(
 
     dataset_yaml = _write_dataset_yaml(dataset_root, class_names)
 
-    yolo = CCIYoloWrapper(str(model_path))
+    train_model_source, source_note = _resolve_segmentation_train_source(model_path)
+    yolo = CCIYoloWrapper(train_model_source)
+
+    train_kwargs = {
+        "project": str(traces_root),
+        "name": "run",
+        "exist_ok": True,
+        "task": "segment",
+    }
+    if train_model_source.lower().endswith(".yaml"):
+        train_kwargs["pretrained"] = False
+
     yolo.train(
         data_set_file=dataset_yaml,
         image_size=cfg.tile_size,
         batch=cfg.batch,
         epochs=cfg.epochs,
         patience=cfg.patience,
-        project=str(traces_root),
-        name="run",
-        exist_ok=True,
-        task="segment",
+        **train_kwargs,
     )
 
     best_model = traces_root / "run" / "weights" / "best.pt"
     if not best_model.exists():
         raise FileNotFoundError(f"best.pt not found at: {best_model}")
 
+    trained_wrapper = CCIYoloWrapper(str(best_model))
+    trained_task = trained_wrapper.model_task().lower()
+    if trained_task != "segment":
+        raise RuntimeError(
+            "Retraining produced a non-segmentation checkpoint "
+            f"(task='{trained_task}'). Training source was '{train_model_source}' ({source_note})."
+        )
+
     run_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(best_model, run_root / "best.pt")
+    (run_root / "training_source.txt").write_text(
+        f"source={train_model_source}\nnote={source_note}\n",
+        encoding="utf-8",
+    )
     return run_root
+
+
+def _resolve_segmentation_train_source(model_path: Path) -> tuple[str, str]:
+    model_path = Path(model_path)
+    if not model_path.exists():
+        return "yolov8n-seg.yaml", "missing input model path; using segmentation scratch config"
+
+    loaded = CCIYoloWrapper(str(model_path))
+    loaded_task = loaded.model_task().lower()
+    if loaded_task == "segment":
+        return str(model_path), "loaded model is already segmentation"
+
+    local_seg_candidate = model_path.with_name(f"{model_path.stem}-seg{model_path.suffix}")
+    if local_seg_candidate.exists():
+        return str(local_seg_candidate), "detected local segmentation sibling checkpoint"
+
+    return "yolov8n-seg.yaml", "loaded model is non-seg; using segmentation model config from scratch"
 
 
 def _collect_pairs(retrain_data_root: Path) -> list[PairPaths]:

@@ -49,7 +49,6 @@ class _RetrainWorker(QThread):
                     val_ratio=0.2,
                     seed=42,
                     batch=4,
-                    epochs=100,
                     patience=30,
                 ),
             )
@@ -307,7 +306,8 @@ class CciYoloSegmentatorQWidget(QWidget):
         if copied_default_model:
             self._show_info(f"No .pt model was found in the folder. Copied bundled model to: {model_path}")
 
-        self._show_info(f"Model loaded: {model_path.name}")
+        model_task = self._yolo.model_task()
+        self._show_info(f"Model loaded: {model_path.name} (task: {model_task})")
 
     def _get_active_image_layer(self):
         layer = self.napari_viewer.layers.selection.active
@@ -344,12 +344,21 @@ class CciYoloSegmentatorQWidget(QWidget):
             return
 
         image_data = np.asarray(image_layer.data)
-        if image_data.ndim < 2:
+        if image_data.ndim < 2 or image_data.ndim > 3:
             self._show_error("Unsupported image shape.")
             return
 
+        if image_data.ndim == 3 and image_data.shape[-1] not in {1, 3, 4}:
+            self._show_error("Unsupported image shape.")
+            return
+
+        image_u8 = self._normalize_to_uint8(image_data)
+        image_rgb = Image.fromarray(image_u8).convert("RGB")
+
+        print(image_rgb)
+
         try:
-            prediction = self._yolo.predict(image_data)
+            prediction = self._yolo.predict(image_rgb)
             result = prediction[0] if len(prediction) else None
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard
             self._show_error(f"Prediction failed: {exc}")
@@ -399,6 +408,13 @@ class CciYoloSegmentatorQWidget(QWidget):
         if self._yolo is None or self._model_path is None:
             self._show_error("Load a model first.")
             return
+
+        loaded_task = self._yolo.model_task().lower()
+        if loaded_task != "segment":
+            self._show_info(
+                "Loaded model is not a segmentation checkpoint "
+                f"(task: {loaded_task}). Retraining will initialize a segmentation model automatically."
+            )
 
         retrain_data_text = self.retrain_data_path_input.text().strip()
         if not retrain_data_text:

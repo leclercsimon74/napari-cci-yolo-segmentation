@@ -1,0 +1,15 @@
+name: yolo_segmentation
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - opencv-python
+    - matplotlib
+    - scikit-image
+    - napari
+    - pandas
+    - scipy
+    - pillow
+    - pyqt5
