@@ -23,13 +23,17 @@ class CCIYoloWrapper:
         self.model = self._create_model(model_name_or_path)
 
     @staticmethod
-    def _create_model(model_name_or_path: str):
+    def _create_model(model_name_or_path):
         try:
             from ultralytics import YOLO
-        except Exception as exc:  # noqa: BLE001  # pragma: no cover - runtime guard
-            raise RuntimeError(
-                "Failed to import ultralytics/torch. Install a compatible build for this platform."
-            ) from exc
+        except ModuleNotFoundError as exc:
+            if exc.name == "ultralytics":
+                raise RuntimeError(
+                    "Ultralytics is not installed in the Python environment "
+                    "running napari."
+                ) from exc
+            raise
+
         return YOLO(model_name_or_path)
 
     def load_model(self, weights_path: Path) -> None:

@@ -1,11 +1,10 @@
 [project]
 name = "napari-cci-yolo-segmentation"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Plugin to simplify segmentation of datasets with yolo"
 readme = "README.md"
 authors = [
-  {name = "Simon Leclerc"},
-  {email = "simon.leclerc@gu.se"},
+    {name = "Simon Leclerc", email = "simon.leclerc@gu.se"},
 ]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
@@ -15,12 +14,11 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "pillow",
@@ -60,7 +58,7 @@ napari_cci_yolo_segmentation = "src/napari-cci-yolo-segmentation"
 
 [tool.black]
 line-length = 79
-target-version = ['py310']
+target-version = ['py311']
 
 [tool.ruff]
 line-length = 79
@@ -105,5 +103,5 @@ exclude = [
     "*_vendor*",
 ]
 
-target-version = "py310"
+target-version = "py311"
 fix = true
