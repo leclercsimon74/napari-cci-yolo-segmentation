@@ -11,6 +11,7 @@ import shutil
 import numpy as np
 from PIL import Image
 from skimage.measure import find_contours, label
+from skimage.morphology import disk, opening
 
 
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -408,7 +409,25 @@ def _read_mask(path: Path) -> np.ndarray:
     arr = np.asarray(Image.open(path))
     if arr.ndim == 3:
         arr = arr[..., 0]
-    return arr
+    return _preprocess_training_mask(arr)
+
+
+def _preprocess_training_mask(mask: np.ndarray) -> np.ndarray:
+    footprint = disk(3)
+    foreground = mask > 0
+    if not np.any(foreground):
+        return np.zeros(mask.shape, dtype=np.uint16)
+
+    label_ids = np.unique(mask[foreground])
+    if len(label_ids) == 1:
+        opened = opening(foreground, footprint)
+        return label(opened, connectivity=1).astype(np.uint16, copy=False)
+
+    processed = np.zeros(mask.shape, dtype=np.uint16)
+    for label_id in label_ids:
+        opened = opening(mask == label_id, footprint)
+        processed[opened] = int(label_id)
+    return processed
 
 
 def _write_lines(path: Path, lines: list[str]) -> None:

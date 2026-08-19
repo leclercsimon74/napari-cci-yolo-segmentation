@@ -100,6 +100,37 @@ def test_mask_to_yolo_segmentation_lines_treats_components_as_objects_single_cla
     assert class_ids == {"0"}
 
 
+def test_preprocess_training_mask_labels_binary_components_after_opening():
+    mod = _load_training_module()
+
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[5:15, 5:15] = 255
+    mask[18:28, 18:28] = 255
+    mask[2, 2] = 255
+
+    processed = mod._preprocess_training_mask(mask)
+
+    assert processed.dtype == np.uint16
+    labels = sorted(int(v) for v in np.unique(processed) if v != 0)
+    assert labels == [1, 2]
+    assert processed[2, 2] == 0
+
+
+def test_preprocess_training_mask_opens_each_existing_label_independently():
+    mod = _load_training_module()
+
+    mask = np.zeros((32, 32), dtype=np.uint16)
+    mask[5:15, 5:15] = 3
+    mask[18:28, 18:28] = 9
+    mask[2, 2] = 9
+
+    processed = mod._preprocess_training_mask(mask)
+
+    labels = sorted(int(v) for v in np.unique(processed) if v != 0)
+    assert labels == [3, 9]
+    assert processed[2, 2] == 0
+
+
 def test_tile_windows_cover_edge_aligned_tiles():
     mod = _load_training_module()
 

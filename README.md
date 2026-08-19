@@ -24,6 +24,16 @@ pip install git+https://github.com/CCI-GU-Sweden/napari-cci-yolo-segmentation.gi
 pip install -e .
 ```
 
+### venv for this one (conflict with pandas)
+
+py -3.12 -m venv .venv
+
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+
+python -m pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install "napari[pyqt6]"
+
 ### Recommended Windows Setup (Conda)
 
 `environment.yml` provides the base environment (Python, numpy, napari, etc.)

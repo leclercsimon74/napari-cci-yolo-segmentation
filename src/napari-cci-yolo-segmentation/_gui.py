@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -18,14 +19,26 @@ from qtpy.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
+    QComboBox,
 )
+
+from skimage.measure import find_contours
+from skimage.morphology import disk, label, remove_small_objects
 
 from ._segmentation_training import (
     CCIYoloWrapper,
     RetrainConfig,
     run_retraining_pipeline,
 )
+from .yolo_tiling_segmentation import (
+    merge_segments_iou,
+    merge_segments_one_pixel_boundary,
+    merge_tile_instances_one_pixel_boundary,
+    predict_instances_with_yolo_tiling,
+)
 
+OVERLAP = 100  # pixels of overlap for tiling segmentation
+TILE_SIZE = 1024  # pixels of tile size for tiling segmentation
 
 class _RetrainWorker(QThread):
     """Runs YOLO segmentation retraining in a background thread."""
@@ -43,9 +56,9 @@ class _RetrainWorker(QThread):
             retrain_root = run_retraining_pipeline(
                 model_path=self._model_path,
                 retrain_data_root=self._retrain_data_path,
-                output_root=None,
+                output_root=self._retrain_data_path / f"retrained_{datetime.now().strftime('%y%m%d_%H%M%S')}",
                 config=RetrainConfig(
-                    tile_size=1024,
+                    tile_size=TILE_SIZE,
                     val_ratio=0.2,
                     seed=42,
                     batch=4,
@@ -69,6 +82,11 @@ class CciYoloSegmentatorQWidget(QWidget):
     """
 
     PRED_LAYER_NAME = "yolo_segments"
+    MERGED_LAYER_PREFIX = "yolo_segments_merged"
+    CROP_SELECTION_LAYER_NAME = "yolo_crop_selection"
+    CROP_IMAGE_LAYER_NAME = "yolo_crop_image"
+    CROP_MASK_LAYER_NAME = "yolo_crop_mask"
+    TILING_THRESHOLD = TILE_SIZE
 
     def __init__(self, napari_viewer):
         super().__init__()
@@ -79,6 +97,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         self._model_path: Path | None = None
         self._retrain_data_path: Path | None = None
         self._retrain_worker: _RetrainWorker | None = None
+        self._crop_source_layers = []
 
         self._spinner_timer = QTimer(self)
         self._spinner_timer.setInterval(400)
@@ -86,6 +105,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         self._spinner_frames = ["Retraining .", "Retraining ..", "Retraining ...", "Retraining"]
         self._spinner_index = 0
 
+        #Button creation and connection
         self._model_path_input = QLineEdit()
         self._model_path_input.setPlaceholderText("Path to YOLO model (.pt) or model folder")
 
@@ -95,8 +115,20 @@ class CciYoloSegmentatorQWidget(QWidget):
         load_button = QPushButton("Load model")
         load_button.clicked.connect(self._on_load_model)
 
-        predict_button = QPushButton("Predict")
+        predict_button = QPushButton("Predict Large Image")
         predict_button.clicked.connect(self._on_predict)
+
+        self.merge_button = QComboBox()
+        self.merge_button.addItems(["One pixel boundary", "IoU"])
+
+        merge_action_button = QPushButton("Merge Segments")
+        merge_action_button.clicked.connect(self._on_merge_segments)
+
+        select_crop_button = QPushButton("Select Crop")
+        select_crop_button.clicked.connect(self._on_select_crop)
+
+        new_crop_button = QPushButton("Create Crop")
+        new_crop_button.clicked.connect(self._on_new_crop)
 
         self.retrain_data_path_input = QLineEdit()
         self.retrain_data_path_input.setPlaceholderText("Retrain folder containing images/ and masks/")
@@ -104,20 +136,26 @@ class CciYoloSegmentatorQWidget(QWidget):
         browse_retrain_data_button = QPushButton("Browse")
         browse_retrain_data_button.clicked.connect(self._on_browse_retrain_data)
 
-        self._add_to_retrain_button = QPushButton("Add to Retrain")
+        self._add_to_retrain_button = QPushButton("Save Crop to Retrain")
         self._add_to_retrain_button.clicked.connect(self._on_add_to_retrain)
 
         self._retrain_button = QPushButton("Retrain")
         self._retrain_button.clicked.connect(self._on_retrain)
 
+        #Gui Layout
         row_model = QHBoxLayout()
         row_model.addWidget(QLabel("Model"))
         row_model.addWidget(self._model_path_input)
         row_model.addWidget(browse_button)
 
-        row_actions = QHBoxLayout()
-        row_actions.addWidget(load_button)
-        row_actions.addWidget(predict_button)
+        row_merging = QHBoxLayout()
+        row_merging.addWidget(QLabel("Merging"))
+        row_merging.addWidget(self.merge_button)
+        row_merging.addWidget(merge_action_button)
+
+        row_crop = QHBoxLayout()
+        row_crop.addWidget(select_crop_button)
+        row_crop.addWidget(new_crop_button)
 
         row_retrain_data = QHBoxLayout()
         row_retrain_data.addWidget(QLabel("Retrain data"))
@@ -128,10 +166,21 @@ class CciYoloSegmentatorQWidget(QWidget):
         row_train.addWidget(self._add_to_retrain_button)
         row_train.addWidget(self._retrain_button)
 
+        self.stats_label = QLabel()
+
         layout = QVBoxLayout()
+        layout.addWidget(QLabel("<b>Model</b>"))
         layout.addLayout(row_model)
-        layout.addLayout(row_actions)
+        layout.addWidget(QLabel("<b>Load Model</b>"))
+        layout.addWidget(load_button)
+        layout.addWidget(QLabel(f"Tile of {TILE_SIZE} pxl with {OVERLAP} pxl overlap for large images"))
+        layout.addWidget(predict_button)
+        layout.addLayout(row_merging)
+        layout.addWidget(QLabel("<b>Review</b>"))
+        layout.addLayout(row_crop)
+        layout.addWidget(QLabel("<b>Crop Correction</b>"))
         layout.addLayout(row_retrain_data)
+        layout.addWidget(self.stats_label)
         layout.addLayout(row_train)
         layout.addStretch(1)
         self.setLayout(layout)
@@ -153,7 +202,375 @@ class CciYoloSegmentatorQWidget(QWidget):
     def _on_browse_retrain_data(self) -> None:
         retrain_dir = QFileDialog.getExistingDirectory(self, "Select retrain folder with images/ and masks/")
         if retrain_dir:
-            self.retrain_data_path_input.setText(retrain_dir)
+            self._set_retrain_data_path(Path(retrain_dir))
+
+    def _set_retrain_data_path(self, path: Path) -> None:
+        self._retrain_data_path = Path(path)
+        self.retrain_data_path_input.setText(str(self._retrain_data_path))
+        self.update_stats_label()
+
+    def _maybe_preselect_retrain_data_path(self) -> None:
+        if self._model_path is None or self.retrain_data_path_input.text().strip():
+            return
+
+        candidate = self._model_path.parent
+        if (candidate / "images").is_dir() and (candidate / "masks").is_dir():
+            self._set_retrain_data_path(candidate)
+
+    def _resolve_retrain_data_path(self, create: bool) -> Path | None:
+        raw_path = self.retrain_data_path_input.text().strip()
+        if raw_path:
+            retrain_root = Path(raw_path)
+        elif self._model_path is not None:
+            retrain_root = self._model_path.parent
+        else:
+            self._show_error("Load a model or select a retrain folder first.")
+            return None
+
+        if create:
+            (retrain_root / "images").mkdir(parents=True, exist_ok=True)
+            (retrain_root / "masks").mkdir(parents=True, exist_ok=True)
+        elif not retrain_root.exists():
+            self._show_error("Retrain folder does not exist.")
+            return None
+
+        self._set_retrain_data_path(retrain_root)
+        return retrain_root
+
+    def _on_select_crop(self) -> None:
+        # generate a rectangular selection pixels on the active image layer
+        image_layer = self._get_active_image_layer()
+        if image_layer is None:
+            return
+
+        image_data = np.asarray(image_layer.data)
+        if image_data.ndim < 2:
+            self._show_error("Active image must be at least 2D.")
+            return
+
+        height, width = image_data.shape[:2]
+        crop_size = min(self.TILING_THRESHOLD, height, width)
+        center_y, center_x = self._current_view_center(height, width)
+        y0, y1, x0, x1 = self._clamped_crop_bounds(
+            center_y,
+            center_x,
+            crop_size,
+            height,
+            width,
+        )
+        rectangle = np.array(
+            [[y0, x0], [y0, x1], [y1, x1], [y1, x0]],
+            dtype=float,
+        )
+
+        existing = self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME)
+        if existing is not None:
+            self.napari_viewer.layers.remove(existing)
+
+        layer = self.napari_viewer.add_shapes(
+            [rectangle],
+            name=self.CROP_SELECTION_LAYER_NAME,
+            shape_type="rectangle",
+            edge_width=3,
+            edge_color="cyan",
+            face_color="transparent",
+        )
+        layer.metadata["crop_size"] = crop_size
+        layer.metadata["source_image_layer_name"] = image_layer.name
+        layer.mode = "select"
+
+        if crop_size < self.TILING_THRESHOLD:
+            self._show_info(
+                f"Image is smaller than {TILE_SIZE}x{TILE_SIZE} in at least one dimension. "
+                f"Created a {crop_size}x{crop_size} crop selection instead."
+            )
+
+    def _on_new_crop(self) -> None:
+        # generate a new crop from the selection (from _on_select_crop)
+        # Should copy both the image layer AND the shape layer. The shape layer need to be converted as segmentation mask.
+        image_layer = self._get_active_image_layer()
+        if image_layer is None:
+            return
+
+        selection_layer = self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME)
+        if selection_layer is None or len(selection_layer.data) == 0:
+            self._show_error("Create a crop selection first.")
+            return
+
+        image_data = np.asarray(image_layer.data)
+        if image_data.ndim not in {2, 3}:
+            self._show_error("Active image must be 2D or RGB.")
+            return
+
+        if image_data.ndim == 3 and image_data.shape[-1] > 3:
+            image_data = image_data[..., :3]
+
+        try:
+            y0, y1, x0, x1 = self._crop_bounds_from_selection(
+                selection_layer,
+                image_data.shape[0],
+                image_data.shape[1],
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._show_error(f"Could not read crop selection: {exc}")
+            return
+
+        crop_image = self._normalize_to_uint8(image_data[y0:y1, x0:x1])
+        crop_mask = np.zeros(crop_image.shape[:2], dtype=np.uint16)
+
+        annotation_layer = self._get_annotation_layer(tuple(image_data.shape[:2]))
+        if annotation_layer is not None and self._is_shapes_like_layer(annotation_layer):
+            try:
+                full_mask = self._build_instance_mask(
+                    annotation_layer,
+                    tuple(image_data.shape[:2]),
+                )
+                crop_mask = full_mask[y0:y1, x0:x1]
+            except ValueError as exc:
+                if "No shapes found" not in str(exc):
+                    self._show_error(f"Could not convert shapes to crop mask: {exc}")
+                    return
+            except Exception as exc:  # noqa: BLE001
+                self._show_error(f"Could not convert shapes to crop mask: {exc}")
+                return
+        elif annotation_layer is not None:
+            crop_mask = np.asarray(annotation_layer.data)[y0:y1, x0:x1].astype(
+                np.uint16,
+                copy=False,
+            )
+
+        self._hide_existing_crop_layers()
+        self._crop_source_layers = [image_layer]
+        if annotation_layer is not None and annotation_layer is not selection_layer:
+            self._crop_source_layers.append(annotation_layer)
+        self._crop_source_layers.append(selection_layer)
+
+        for layer in self._crop_source_layers:
+            layer.visible = False
+
+        crop_image_layer = self.napari_viewer.add_image(
+            crop_image,
+            name=self.CROP_IMAGE_LAYER_NAME,
+        )
+        crop_mask_layer = self.napari_viewer.add_labels(
+            crop_mask,
+            name=self.CROP_MASK_LAYER_NAME,
+        )
+        crop_image_layer.metadata["source_image_layer_name"] = image_layer.name
+        crop_image_layer.metadata["crop_bounds_yx"] = (y0, y1, x0, x1)
+        crop_mask_layer.metadata["source_shapes_layer_name"] = (
+            getattr(annotation_layer, "name", None)
+            if annotation_layer is not None and annotation_layer is not selection_layer
+            else None
+        )
+        crop_mask_layer.metadata["crop_bounds_yx"] = (y0, y1, x0, x1)
+
+        self.napari_viewer.layers.selection.active = crop_mask_layer
+        self._show_info(f"Created crop: y={y0}:{y1}, x={x0}:{x1}.")
+
+    def update_stats_label(self) -> None:
+        # add some stats to this label for information
+        # number of images
+        # number of masks
+        # number of unique labels in masks if possible - require to open each mask!
+        raw_path = self.retrain_data_path_input.text().strip()
+        if raw_path:
+            self._retrain_data_path = Path(raw_path)
+
+        if self._retrain_data_path is None:
+            self.stats_label.setText("No retrain data selected.")
+            return
+        # number of images
+        images_dir = self._retrain_data_path / "images"
+        masks_dir = self._retrain_data_path / "masks"
+        num_images = len(os.listdir(images_dir)) if images_dir.exists() else 0
+        num_masks = len(os.listdir(masks_dir)) if masks_dir.exists() else 0
+
+        self.stats_label.setText(f"Retrain data: {num_images} images, {num_masks} masks.")
+
+    def _hide_existing_crop_layers(self) -> None:
+        for layer in self._crop_source_layers:
+            if layer in self.napari_viewer.layers:
+                layer.visible = True
+
+        for name in (self.CROP_IMAGE_LAYER_NAME, self.CROP_MASK_LAYER_NAME):
+            layer = self._get_layer_by_name(name)
+            if layer is not None:
+                self.napari_viewer.layers.remove(layer)
+
+    def _current_view_center(self, height: int, width: int) -> tuple[float, float]:
+        center = getattr(getattr(self.napari_viewer, "camera", None), "center", None)
+        if center is None:
+            return height / 2.0, width / 2.0
+
+        if len(center) >= 2:
+            return float(center[-2]), float(center[-1])
+        return height / 2.0, width / 2.0
+
+    def _merge_segments(self, method: str) -> None:
+        pred_layer = self._get_latest_segments_layer()
+        if pred_layer is None:
+            self._show_error("No prediction layer found to merge.")
+            return
+
+        pred_data = np.asarray(pred_layer.data)
+        if pred_data.ndim != 2:
+            self._show_error("Prediction layer must be a 2D labels layer.")
+            return
+
+        if method == "One pixel boundary":
+            merged_mask = self._merge_tile_instances_one_pixel_boundary(pred_layer)
+        elif method == "IoU":
+            merged_mask = self._merge_segments_iou(pred_layer)
+        else:
+            self._show_error(f"Unknown merging method: {method}")
+            return
+
+        if merged_mask is None:
+            return
+
+        layer_name = self._next_merged_layer_name(method)
+        merged_layer = self.napari_viewer.add_labels(
+            merged_mask,
+            name=layer_name,
+        )
+        merged_layer.metadata.update(pred_layer.metadata)
+        merged_layer.metadata["merge_method"] = method
+        merged_layer.metadata["merge_source_layer_name"] = pred_layer.name
+        self.napari_viewer.layers.selection.active = merged_layer
+        self._show_info(f"Merged segments using method: {method}. Created layer: {layer_name}")
+
+    def _on_merge_segments(self) -> None:
+        self._merge_segments(self.merge_button.currentText())
+
+    def _merge_segments_one_pixel_boundary(self, pred_data: np.ndarray) -> np.ndarray:
+        return merge_segments_one_pixel_boundary(
+            pred_data,
+            image_size=self.TILING_THRESHOLD,
+            overlap=OVERLAP,
+        )
+
+    def _merge_tile_instances_one_pixel_boundary(self, pred_layer) -> np.ndarray:
+        instances = pred_layer.metadata.get("yolo_tile_instances")
+        if instances:
+            return merge_tile_instances_one_pixel_boundary(
+                instances=instances,
+                shape=np.asarray(pred_layer.data).shape,
+                image_size=self.TILING_THRESHOLD,
+                overlap=OVERLAP,
+            )
+
+        return self._merge_segments_one_pixel_boundary(np.asarray(pred_layer.data))
+
+    def _merge_segments_iou(self, pred_layer) -> np.ndarray | None:
+        instances = pred_layer.metadata.get("yolo_tile_instances")
+        if not instances:
+            self._show_error(
+                "IoU merging requires a large-image prediction created by this session."
+            )
+            return None
+
+        return merge_segments_iou(
+            instances=instances,
+            shape=np.asarray(pred_layer.data).shape,
+            iou_threshold=0.4,
+        )
+
+    def _get_latest_segments_layer(self):
+        for layer in reversed(self.napari_viewer.layers):
+            if self._is_segments_layer(layer):
+                return layer
+        return None
+
+    def _is_segments_layer(self, layer) -> bool:
+        name = getattr(layer, "name", None)
+        if name is None:
+            return False
+        if name != self.PRED_LAYER_NAME and not name.startswith(f"{self.MERGED_LAYER_PREFIX}_"):
+            return False
+        data = getattr(layer, "data", None)
+        return data is not None and np.asarray(data).ndim == 2
+
+    def _next_merged_layer_name(self, method: str) -> str:
+        method_name = self._sanitize_stem(method).lower()
+        prefix = f"{self.MERGED_LAYER_PREFIX}_{method_name}"
+        existing_names = {getattr(layer, "name", "") for layer in self.napari_viewer.layers}
+        index = 1
+        while True:
+            name = f"{prefix}_{index:03d}"
+            if name not in existing_names:
+                return name
+            index += 1
+
+    def _get_annotation_layer(self, mask_shape: tuple[int, int]):
+        pred_layer = self._get_latest_segments_layer()
+        if pred_layer is not None:
+            if self._is_shapes_like_layer(pred_layer):
+                return pred_layer
+            pred_data = np.asarray(getattr(pred_layer, "data", None))
+            if pred_data.ndim == 2 and pred_data.shape == mask_shape:
+                return pred_layer
+
+        return self._get_shapes_layer()
+
+    @staticmethod
+    def _clamped_crop_bounds(
+        center_y: float,
+        center_x: float,
+        crop_size: int,
+        height: int,
+        width: int,
+    ) -> tuple[int, int, int, int]:
+        y0 = int(round(center_y - crop_size / 2))
+        x0 = int(round(center_x - crop_size / 2))
+        y0 = max(0, min(y0, height - crop_size))
+        x0 = max(0, min(x0, width - crop_size))
+        return y0, y0 + crop_size, x0, x0 + crop_size
+
+    def _crop_bounds_from_selection(
+        self,
+        selection_layer,
+        height: int,
+        width: int,
+    ) -> tuple[int, int, int, int]:
+        data = np.asarray(selection_layer.data[0], dtype=float)
+        if data.ndim != 2 or data.shape[1] < 2:
+            raise ValueError("Crop selection is not a 2D rectangle.")
+
+        y_min = float(np.min(data[:, 0]))
+        y_max = float(np.max(data[:, 0]))
+        x_min = float(np.min(data[:, 1]))
+        x_max = float(np.max(data[:, 1]))
+        crop_size = int(selection_layer.metadata.get("crop_size", self.TILING_THRESHOLD))
+        crop_size = min(crop_size, height, width)
+
+        selected_height = int(round(y_max - y_min))
+        selected_width = int(round(x_max - x_min))
+        if selected_height != crop_size or selected_width != crop_size:
+            center_y = (y_min + y_max) / 2.0
+            center_x = (x_min + x_max) / 2.0
+            y0, y1, x0, x1 = self._clamped_crop_bounds(
+                center_y,
+                center_x,
+                crop_size,
+                height,
+                width,
+            )
+            selection_layer.data = [
+                np.array(
+                    [[y0, x0], [y0, x1], [y1, x1], [y1, x0]],
+                    dtype=float,
+                )
+            ]
+            return y0, y1, x0, x1
+
+        return self._clamped_crop_bounds(
+            (y_min + y_max) / 2.0,
+            (x_min + x_max) / 2.0,
+            crop_size,
+            height,
+            width,
+        )
 
     @staticmethod
     def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
@@ -182,12 +599,44 @@ class CciYoloSegmentatorQWidget(QWidget):
         return cleaned or "sample"
 
     @staticmethod
+    def _to_grayscale(image: np.ndarray) -> np.ndarray:
+        if image.ndim == 2:
+            return image
+        if image.ndim == 3 and image.shape[-1] == 1:
+            return image[..., 0]
+        return np.asarray(Image.fromarray(image).convert("L"))
+
+    @staticmethod
+    def _to_pil_rgb(image: np.ndarray) -> Image.Image:
+        if image.ndim == 3 and image.shape[-1] == 1:
+            image = image[..., 0]
+        return Image.fromarray(image).convert("RGB")
+
+    @staticmethod
+    def _label_mask_to_polygons(label_mask: np.ndarray) -> list[np.ndarray]:
+        polygons = []
+        for label_id in np.unique(label_mask):
+            if label_id == 0:
+                continue
+
+            binary = label_mask == label_id
+            for contour in find_contours(binary.astype(np.uint8), level=0.5):
+                if contour.shape[0] < 3:
+                    continue
+                polygons.append(np.asarray(contour, dtype=float))
+        return polygons
+
+    @staticmethod
     def _is_shapes_like_layer(layer) -> bool:
         return hasattr(layer, "to_masks") and hasattr(layer, "shape_type")
 
     def _get_shapes_layer(self):
         active = self.napari_viewer.layers.selection.active
-        if active is not None and self._is_shapes_like_layer(active):
+        if (
+            active is not None
+            and self._is_shapes_like_layer(active)
+            and getattr(active, "name", None) != self.CROP_SELECTION_LAYER_NAME
+        ):
             return active
 
         pred = self._get_layer_by_name(self.PRED_LAYER_NAME)
@@ -195,7 +644,10 @@ class CciYoloSegmentatorQWidget(QWidget):
             return pred
 
         for layer in self.napari_viewer.layers:
-            if self._is_shapes_like_layer(layer):
+            if (
+                self._is_shapes_like_layer(layer)
+                and getattr(layer, "name", None) != self.CROP_SELECTION_LAYER_NAME
+            ):
                 return layer
         return None
 
@@ -212,6 +664,18 @@ class CciYoloSegmentatorQWidget(QWidget):
     def _on_add_to_retrain(self) -> None:
         if self._model_path is None:
             self._show_error("Load a model first.")
+            return
+
+        has_crop_layers = (
+            self._get_layer_by_name(self.CROP_IMAGE_LAYER_NAME) is not None
+            or self._get_layer_by_name(self.CROP_MASK_LAYER_NAME) is not None
+        )
+        if has_crop_layers:
+            crop_pair = self._get_current_crop_retrain_pair()
+            if crop_pair is None:
+                return
+            image_u8, instance_mask, stem = crop_pair
+            self._save_retrain_pair(image_u8, instance_mask, stem)
             return
 
         image_layer = self._get_active_image_layer()
@@ -240,20 +704,79 @@ class CciYoloSegmentatorQWidget(QWidget):
             self._show_error(f"Could not create mask from shapes: {exc}")
             return
 
-        model_root = self._model_path.parent
-        images_dir = model_root / "images"
-        masks_dir = model_root / "masks"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        masks_dir.mkdir(parents=True, exist_ok=True)
+        stem = self._build_retrain_stem(
+            source_name=image_layer.name,
+            crop_bounds=None,
+        )
+        self._save_retrain_pair(image_u8, instance_mask, stem)
 
-        stem = self._sanitize_stem(f"{image_layer.name}_{datetime.now().strftime('%y%m%d_%H%M%S_%f')}")
+    def _get_current_crop_retrain_pair(self):
+        crop_image_layer = self._get_layer_by_name(self.CROP_IMAGE_LAYER_NAME)
+        crop_mask_layer = self._get_layer_by_name(self.CROP_MASK_LAYER_NAME)
+        if crop_image_layer is None and crop_mask_layer is None:
+            return None
+        if crop_image_layer is None or crop_mask_layer is None:
+            self._show_error("Both crop image and crop mask layers are required before adding a crop to retrain.")
+            return None
+
+        image_data = np.asarray(crop_image_layer.data)
+        mask_data = np.asarray(crop_mask_layer.data)
+        if image_data.ndim not in {2, 3}:
+            self._show_error("Crop image must be 2D or RGB.")
+            return None
+        if image_data.ndim == 3 and image_data.shape[-1] > 3:
+            image_data = image_data[..., :3]
+        if mask_data.ndim == 3:
+            mask_data = mask_data[..., 0]
+        if mask_data.ndim != 2:
+            self._show_error("Crop mask must be a 2D labels layer.")
+            return None
+
+        image_u8 = self._normalize_to_uint8(image_data)
+        if image_u8.shape[:2] != mask_data.shape[:2]:
+            self._show_error(
+                "Crop image and crop mask shapes do not match: "
+                f"image={image_u8.shape[:2]}, mask={mask_data.shape[:2]}."
+            )
+            return None
+
+        crop_bounds = crop_image_layer.metadata.get(
+            "crop_bounds_yx",
+            crop_mask_layer.metadata.get("crop_bounds_yx"),
+        )
+        source_name = crop_image_layer.metadata.get(
+            "source_image_layer_name",
+            crop_image_layer.name,
+        )
+        stem = self._build_retrain_stem(
+            source_name=source_name,
+            crop_bounds=crop_bounds,
+        )
+        return image_u8, mask_data.astype(np.uint16, copy=False), stem
+
+    def _build_retrain_stem(self, source_name: str, crop_bounds) -> str:
+        parts = [self._sanitize_stem(source_name)]
+        if crop_bounds is not None and len(crop_bounds) == 4:
+            y0, y1, x0, x1 = [int(v) for v in crop_bounds]
+            parts.append(f"y{y0}-{y1}_x{x0}-{x1}")
+        parts.append(datetime.now().strftime("%y%m%d_%H%M%S_%f"))
+        return "_".join(parts)
+
+    def _save_retrain_pair(self, image_u8: np.ndarray, instance_mask: np.ndarray, stem: str) -> None:
+        retrain_root = self._resolve_retrain_data_path(create=True)
+        if retrain_root is None:
+            return
+
+        images_dir = retrain_root / "images"
+        masks_dir = retrain_root / "masks"
+
         image_out = images_dir / f"{stem}.png"
         mask_out = masks_dir / f"{stem}.png"
 
         Image.fromarray(image_u8).save(image_out)
         Image.fromarray(instance_mask).save(mask_out)
 
-        self.retrain_data_path_input.setText(str(model_root))
+        self.update_stats_label()
         self._show_info(
             "Saved current image/mask pair for retraining:\n"
             f"- Image: {image_out}\n"
@@ -299,6 +822,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         try:
             self._yolo = CCIYoloWrapper(str(model_path))
             self._model_path = model_path
+            self._maybe_preselect_retrain_data_path()
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard
             self._show_error(f"Could not load model: {exc}")
             return
@@ -311,15 +835,13 @@ class CciYoloSegmentatorQWidget(QWidget):
 
     def _get_active_image_layer(self):
         layer = self.napari_viewer.layers.selection.active
-        if layer is not None and not self._is_shapes_like_layer(layer) and getattr(layer, "data", None) is not None:
+        if layer is not None and self._is_candidate_image_layer(layer):
             data = np.asarray(layer.data)
             if data.ndim >= 2:
                 return layer
 
         for candidate in reversed(self.napari_viewer.layers):
-            if self._is_shapes_like_layer(candidate):
-                continue
-            if getattr(candidate, "data", None) is None:
+            if not self._is_candidate_image_layer(candidate):
                 continue
             data = np.asarray(candidate.data)
             if data.ndim >= 2:
@@ -327,6 +849,17 @@ class CciYoloSegmentatorQWidget(QWidget):
 
         self._show_error("Open or select an image layer first.")
         return None
+
+    def _is_candidate_image_layer(self, layer) -> bool:
+        if self._is_shapes_like_layer(layer):
+            return False
+        if getattr(layer, "data", None) is None:
+            return False
+        return getattr(layer, "name", None) not in {
+            self.PRED_LAYER_NAME,
+            self.CROP_SELECTION_LAYER_NAME,
+            self.CROP_MASK_LAYER_NAME,
+        }
 
     def _get_layer_by_name(self, name: str):
         for layer in self.napari_viewer.layers:
@@ -353,24 +886,37 @@ class CciYoloSegmentatorQWidget(QWidget):
             return
 
         image_u8 = self._normalize_to_uint8(image_data)
-        image_rgb = Image.fromarray(image_u8).convert("RGB")
-
-        print(image_rgb)
-
+        tiled_mask = None
+        tile_instances = []
         try:
-            prediction = self._yolo.predict(image_rgb)
-            result = prediction[0] if len(prediction) else None
+            height, width = image_u8.shape[:2]
+            if height > self.TILING_THRESHOLD or width > self.TILING_THRESHOLD:
+                if self._model_path is None:
+                    self._show_error("Load a model first.")
+                    return
+
+                tiled_mask, tile_instances = predict_instances_with_yolo_tiling(
+                    image_data=self._to_grayscale(image_u8),
+                    model_path=str(self._model_path),
+                    image_size=self.TILING_THRESHOLD,
+                )
+                result = None
+                polygons = []
+            else:
+                image_rgb = self._to_pil_rgb(image_u8)
+                prediction = self._yolo.predict(image_rgb)
+                result = prediction[0] if len(prediction) else None
+
+                polygons = []
+                if result is not None and result.masks is not None and getattr(result.masks, "xy", None) is not None:
+                    for points in result.masks.xy:
+                        if len(points) < 3:
+                            continue
+                        poly_xy = np.asarray(points, dtype=float)
+                        polygons.append(np.column_stack((poly_xy[:, 1], poly_xy[:, 0])))
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard
             self._show_error(f"Prediction failed: {exc}")
             return
-
-        polygons = []
-        if result is not None and result.masks is not None and getattr(result.masks, "xy", None) is not None:
-            for points in result.masks.xy:
-                if len(points) < 3:
-                    continue
-                poly_xy = np.asarray(points, dtype=float)
-                polygons.append(np.column_stack((poly_xy[:, 1], poly_xy[:, 0])))
 
         rects = []
         if not polygons and result is not None and result.boxes is not None:
@@ -392,6 +938,19 @@ class CciYoloSegmentatorQWidget(QWidget):
                 face_color="transparent",
             )
             self._show_info(f"Prediction done: {len(polygons)} segment(s).")
+            return
+
+        if result is None and tiled_mask is not None:
+            pred_layer = self.napari_viewer.add_labels(
+                tiled_mask,
+                name=self.PRED_LAYER_NAME,
+            )
+            pred_layer.metadata["yolo_tile_instances"] = tile_instances
+            pred_layer.metadata["yolo_iou_threshold"] = 0.4
+            self._show_info(
+                "Large image prediction done. "
+                "Use Merge Segments to merge labels across tile boundaries."
+            )
             return
 
         self.napari_viewer.add_shapes(
@@ -416,18 +975,13 @@ class CciYoloSegmentatorQWidget(QWidget):
                 f"(task: {loaded_task}). Retraining will initialize a segmentation model automatically."
             )
 
-        retrain_data_text = self.retrain_data_path_input.text().strip()
-        if not retrain_data_text:
+        retrain_data_path = self._resolve_retrain_data_path(create=False)
+        if retrain_data_path is None:
             self._show_error("Select a retrain folder containing images/ and masks/.")
             return
 
-        self._retrain_data_path = Path(retrain_data_text)
-        if not self._retrain_data_path.exists():
-            self._show_error("Retrain folder does not exist.")
-            return
-
-        images_dir = self._retrain_data_path / "images"
-        masks_dir = self._retrain_data_path / "masks"
+        images_dir = retrain_data_path / "images"
+        masks_dir = retrain_data_path / "masks"
         if not images_dir.exists() or not masks_dir.exists():
             self._show_error("Retrain folder must contain images/ and masks/ subfolders.")
             return
