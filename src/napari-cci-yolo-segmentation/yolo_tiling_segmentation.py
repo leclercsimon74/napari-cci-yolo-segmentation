@@ -10,6 +10,81 @@ import numpy as np
 import skimage.color
 import skimage.segmentation
 
+YOLO_IOU = 0.4
+YOLO_MASK_PADDING = 0.15
+MERGE_IOU_THRESHOLD = 0.4
+
+
+def create_padded_segmentation_predictor(mask_padding: float = YOLO_MASK_PADDING):
+    try:
+        from ultralytics.engine.results import Results
+        from ultralytics.models.yolo.segment import SegmentationPredictor
+        from ultralytics.utils import ops
+    except ModuleNotFoundError as exc:
+        if exc.name == "ultralytics":
+            raise RuntimeError(
+                "Ultralytics is not installed in the Python environment "
+                "running napari."
+            ) from exc
+        raise
+
+    class PaddedSegmentationPredictor(SegmentationPredictor):
+        def construct_result(self, pred, img, orig_img, img_path, proto):
+            if pred.shape[0] == 0:
+                masks = None
+            elif self.args.retina_masks:
+                pred[:, :4] = ops.scale_boxes(
+                    img.shape[2:],
+                    pred[:, :4],
+                    orig_img.shape,
+                )
+
+                mask_boxes = pred[:, :4].clone()
+                widths = mask_boxes[:, 2] - mask_boxes[:, 0]
+                heights = mask_boxes[:, 3] - mask_boxes[:, 1]
+
+                mask_boxes[:, 0] -= mask_padding * widths
+                mask_boxes[:, 1] -= mask_padding * heights
+                mask_boxes[:, 2] += mask_padding * widths
+                mask_boxes[:, 3] += mask_padding * heights
+
+                height, width = orig_img.shape[:2]
+                mask_boxes[:, 0].clamp_(0, width)
+                mask_boxes[:, 2].clamp_(0, width)
+                mask_boxes[:, 1].clamp_(0, height)
+                mask_boxes[:, 3].clamp_(0, height)
+
+                masks = ops.process_mask_native(
+                    proto,
+                    pred[:, 6:],
+                    mask_boxes,
+                    orig_img.shape[:2],
+                )
+            else:
+                masks = ops.process_mask(
+                    proto,
+                    pred[:, 6:],
+                    pred[:, :4],
+                    img.shape[2:],
+                    upsample=True,
+                )
+
+                pred[:, :4] = ops.scale_boxes(
+                    img.shape[2:],
+                    pred[:, :4],
+                    orig_img.shape,
+                )
+
+            return Results(
+                orig_img,
+                path=img_path,
+                names=self.model.names,
+                boxes=pred[:, :6],
+                masks=masks,
+            )
+
+    return PaddedSegmentationPredictor
+
 
 def _normalize_to_uint8(image_data):
     image = np.asarray(image_data)
@@ -40,6 +115,7 @@ class TileInstance:
     tile_origin: tuple[int, int]
     bbox: tuple[int, int, int, int]
     mask: np.ndarray
+    detection_bbox: tuple[int, int, int, int] | None = None
 
 
 class IntGenerator:
@@ -115,9 +191,17 @@ class EquivalenceList:
 
 
 class YoloSegmenter:
-    def __init__(self, model_path: str, image_size: int):
+    def __init__(
+        self,
+        model_path: str,
+        image_size: int,
+        iou: float = YOLO_IOU,
+        mask_padding: float = YOLO_MASK_PADDING,
+    ):
         self.model_mutex = threading.Lock()
         self.image_size = image_size
+        self.iou = iou
+        self.predictor_cls = create_padded_segmentation_predictor(mask_padding)
         self.int_gen = IntGenerator()
         self.model = self._create_model(model_path)
 
@@ -144,6 +228,8 @@ class YoloSegmenter:
                 imgsz=self.image_size,
                 retina_masks=True,
                 verbose=False,
+                iou=self.iou,
+                predictor=self.predictor_cls,
             )
 
         all_masks = np.zeros(shape=data.shape, dtype=np.uint32)
@@ -182,6 +268,8 @@ class YoloSegmenter:
                 imgsz=self.image_size,
                 retina_masks=True,
                 verbose=False,
+                iou=self.iou,
+                predictor=self.predictor_cls,
             )
 
         if result is None or result[0].masks is None:
@@ -190,9 +278,12 @@ class YoloSegmenter:
         result0 = result[0]
         masks = result0.masks.data.cpu().numpy()
         confs = np.ones(len(masks), dtype=float)
+        detection_boxes = None
         boxes = getattr(result0, "boxes", None)
         if boxes is not None and getattr(boxes, "conf", None) is not None:
             confs = boxes.conf.cpu().numpy().astype(float)
+        if boxes is not None and getattr(boxes, "xyxy", None) is not None:
+            detection_boxes = boxes.xyxy.cpu().numpy()
 
         instances = []
         output_height, output_width = output_shape
@@ -223,6 +314,15 @@ class YoloSegmenter:
             global_mask = np.zeros((y1 - y0, x1 - x0), dtype=bool)
             global_mask[global_ys - y0, global_xs - x0] = True
             confidence = float(confs[mask_index]) if mask_index < len(confs) else 1.0
+            detection_bbox = None
+            if detection_boxes is not None and mask_index < len(detection_boxes):
+                box_x0, box_y0, box_x1, box_y1 = detection_boxes[mask_index]
+                detection_bbox = (
+                    max(0, int(round(box_y0 + global_y0))),
+                    min(output_height, int(round(box_y1 + global_y0))),
+                    max(0, int(round(box_x0 + global_x0))),
+                    min(output_width, int(round(box_x1 + global_x0))),
+                )
             instances.append(
                 TileInstance(
                     label_id=self.int_gen.get_next(),
@@ -230,6 +330,7 @@ class YoloSegmenter:
                     tile_origin=(global_y0, global_x0),
                     bbox=(y0, y1, x0, x1),
                     mask=global_mask,
+                    detection_bbox=detection_bbox,
                 )
             )
 
@@ -242,7 +343,10 @@ class LargeImageYoloSegmenter:
 
     @staticmethod
     def calculate_chunk_size(image_size: int, overlap: int) -> int:
-        return int(image_size - (2 * overlap))
+        chunk_size = int(image_size - (2 * overlap))
+        if chunk_size <= 0:
+            raise ValueError("overlap must be smaller than half of image_size")
+        return chunk_size
 
     def _calculate_neighbour_equivalence_ids(
         self,
@@ -412,7 +516,11 @@ class LargeImageYoloSegmenter:
         return instances
 
     @staticmethod
-    def render_instances(instances: list[TileInstance], shape: tuple[int, int]) -> np.ndarray:
+    def render_instances(
+        instances: list[TileInstance],
+        shape: tuple[int, int],
+        label_id_map=None,
+    ) -> np.ndarray:
         labels = np.zeros(shape, dtype=np.uint32)
         confidence_map = np.full(shape, -np.inf, dtype=float)
         for instance in instances:
@@ -420,7 +528,12 @@ class LargeImageYoloSegmenter:
             region_conf = confidence_map[y0:y1, x0:x1]
             region_labels = labels[y0:y1, x0:x1]
             update = instance.mask & (instance.confidence >= region_conf)
-            region_labels[update] = instance.label_id
+            label_id = (
+                label_id_map(instance.label_id)
+                if label_id_map is not None
+                else instance.label_id
+            )
+            region_labels[update] = label_id
             region_conf[update] = instance.confidence
         return labels
 
@@ -469,6 +582,38 @@ class LargeImageYoloSegmenter:
     ):
         self.table_of_ids = EquivalenceList()
 
+        equivalences, padded_segments, original_height, original_width = (
+            self._build_one_pixel_boundary_equivalences(
+                segment_results=segment_results,
+                image_size=image_size,
+                overlap=overlap,
+            )
+        )
+
+        height, width = padded_segments.shape[:2]
+        final_dask = da.from_array(padded_segments).reshape((height, width)).rechunk(
+            (self.calculate_chunk_size(image_size, overlap), self.calculate_chunk_size(image_size, overlap))
+        )
+        self.table_of_ids = equivalences
+        end_result = final_dask.map_blocks(self._find_and_change_ids_along_border, dtype=np.uint32)
+
+        start = timer()
+        result = end_result.compute()
+        end = timer()
+        print("segmentation+merge runtime (s):", end - start)
+
+        if clear_borders:
+            result = skimage.segmentation.clear_border(result)
+
+        return result[:original_height, :original_width]
+
+    def _build_one_pixel_boundary_equivalences(
+        self,
+        segment_results,
+        image_size: int = 1024,
+        overlap: int = 100,
+    ):
+        self.table_of_ids = EquivalenceList()
         chunk_size = self.calculate_chunk_size(image_size, overlap)
         padded_segments, original_height, original_width = self._pad_to_chunk_grid(
             segment_results,
@@ -501,25 +646,13 @@ class LargeImageYoloSegmenter:
 
         res = v1_result.compute(scheduler="threads")
         self.table_of_ids.group_ids()
-
-        final_dask = da.from_array(res).reshape((height, width)).rechunk((chunk_size, chunk_size))
-        end_result = final_dask.map_blocks(self._find_and_change_ids_along_border, dtype=np.uint32)
-
-        start = timer()
-        result = end_result.compute()
-        end = timer()
-        print("segmentation+merge runtime (s):", end - start)
-
-        if clear_borders:
-            result = skimage.segmentation.clear_border(result)
-
-        return result[:original_height, :original_width]
+        return self.table_of_ids, res, original_height, original_width
 
     def merge_segments_iou(
         self,
         instances: list[TileInstance],
         shape: tuple[int, int],
-        iou_threshold: float = 0.4,
+        iou_threshold: float = MERGE_IOU_THRESHOLD,
         clear_borders=False,
     ) -> np.ndarray:
         equivalences = EquivalenceList()
@@ -533,14 +666,11 @@ class LargeImageYoloSegmenter:
                     equivalences.add_equivalence_pair(first.label_id, second.label_id)
 
         equivalences.group_ids()
-        groups: dict[int, TileInstance] = {}
-        for instance in instances:
-            group_id = equivalences.get_equivalent_id(instance.label_id)
-            current = groups.get(group_id)
-            if current is None or instance.confidence > current.confidence:
-                groups[group_id] = instance
-
-        merged = self.render_instances(list(groups.values()), shape)
+        merged = self.render_instances(
+            instances,
+            shape,
+            label_id_map=equivalences.get_equivalent_id,
+        )
         if clear_borders:
             merged = skimage.segmentation.clear_border(merged)
         return merged
@@ -562,8 +692,21 @@ class LargeImageYoloSegmenter:
 LargeImageYoloSegmentator = LargeImageYoloSegmenter
 
 
-def segment_with_yolo_tiling(image_data, model_path: str, image_size: int = 1024, overlap: int = 100, clear_borders: bool = False):
-    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size)
+def segment_with_yolo_tiling(
+    image_data,
+    model_path: str,
+    image_size: int = 1024,
+    overlap: int = 100,
+    clear_borders: bool = False,
+    iou: float = YOLO_IOU,
+    mask_padding: float = YOLO_MASK_PADDING,
+):
+    yolo_segmenter = YoloSegmenter(
+        model_path=model_path,
+        image_size=image_size,
+        iou=iou,
+        mask_padding=mask_padding,
+    )
     segmenter = LargeImageYoloSegmenter()
     return segmenter.segment_large_image_data(
         yolo_segmenter=yolo_segmenter,
@@ -573,8 +716,20 @@ def segment_with_yolo_tiling(image_data, model_path: str, image_size: int = 1024
     )
 
 
-def predict_segments_with_yolo_tiling(image_data, model_path: str, image_size: int = 1024, overlap: int = 100):
-    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size)
+def predict_segments_with_yolo_tiling(
+    image_data,
+    model_path: str,
+    image_size: int = 1024,
+    overlap: int = 100,
+    iou: float = YOLO_IOU,
+    mask_padding: float = YOLO_MASK_PADDING,
+):
+    yolo_segmenter = YoloSegmenter(
+        model_path=model_path,
+        image_size=image_size,
+        iou=iou,
+        mask_padding=mask_padding,
+    )
     segmenter = LargeImageYoloSegmenter()
     return segmenter.predict_segments(
         yolo_segmenter=yolo_segmenter,
@@ -583,9 +738,21 @@ def predict_segments_with_yolo_tiling(image_data, model_path: str, image_size: i
     )
 
 
-def predict_instances_with_yolo_tiling(image_data, model_path: str, image_size: int = 1024, overlap: int = 100):
+def predict_instances_with_yolo_tiling(
+    image_data,
+    model_path: str,
+    image_size: int = 1024,
+    overlap: int = 100,
+    iou: float = YOLO_IOU,
+    mask_padding: float = YOLO_MASK_PADDING,
+):
     image_data = _normalize_to_uint8(image_data)
-    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size)
+    yolo_segmenter = YoloSegmenter(
+        model_path=model_path,
+        image_size=image_size,
+        iou=iou,
+        mask_padding=mask_padding,
+    )
     segmenter = LargeImageYoloSegmenter()
     instances = segmenter.predict_instances(
         yolo_segmenter=yolo_segmenter,
@@ -620,18 +787,25 @@ def merge_tile_instances_one_pixel_boundary(
         image_size=image_size,
         overlap=overlap,
     )
-    return segmenter.merge_segments_one_pixel_boundary(
+    equivalences, _, _, _ = segmenter._build_one_pixel_boundary_equivalences(
         segment_results=central_labels,
         image_size=image_size,
         overlap=overlap,
-        clear_borders=clear_borders,
     )
+    merged = segmenter.render_instances(
+        instances,
+        shape,
+        label_id_map=equivalences.get_equivalent_id,
+    )
+    if clear_borders:
+        merged = skimage.segmentation.clear_border(merged)
+    return merged
 
 
 def merge_segments_iou(
     instances: list[TileInstance],
     shape: tuple[int, int],
-    iou_threshold: float = 0.4,
+    iou_threshold: float = MERGE_IOU_THRESHOLD,
     clear_borders: bool = False,
 ):
     segmenter = LargeImageYoloSegmenter()

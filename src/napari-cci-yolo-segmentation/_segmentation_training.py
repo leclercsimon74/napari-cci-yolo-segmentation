@@ -44,8 +44,8 @@ class CCIYoloWrapper:
         task = getattr(self.model, "task", None)
         return str(task) if task is not None else "unknown"
 
-    def predict(self, img):
-        return self.model.predict(source=img)
+    def predict(self, img, **kwargs):
+        return self.model.predict(source=img, **kwargs)
 
     def train(
         self,

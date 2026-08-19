@@ -31,13 +31,17 @@ from ._segmentation_training import (
     run_retraining_pipeline,
 )
 from .yolo_tiling_segmentation import (
+    MERGE_IOU_THRESHOLD,
+    YOLO_MASK_PADDING,
+    YOLO_IOU,
+    create_padded_segmentation_predictor,
     merge_segments_iou,
     merge_segments_one_pixel_boundary,
     merge_tile_instances_one_pixel_boundary,
     predict_instances_with_yolo_tiling,
 )
 
-OVERLAP = 100  # pixels of overlap for tiling segmentation
+OVERLAP = 108  # pixels of overlap for tiling segmentation
 TILE_SIZE = 1024  # pixels of tile size for tiling segmentation
 
 class _RetrainWorker(QThread):
@@ -82,7 +86,9 @@ class CciYoloSegmentatorQWidget(QWidget):
     """
 
     PRED_LAYER_NAME = "yolo_segments"
+    BBOX_LAYER_NAME = "yolo_bboxes"
     MERGED_LAYER_PREFIX = "yolo_segments_merged"
+    TILE_GRID_LAYER_PREFIX = "yolo_tile_grid"
     CROP_SELECTION_LAYER_NAME = "yolo_crop_selection"
     CROP_IMAGE_LAYER_NAME = "yolo_crop_image"
     CROP_MASK_LAYER_NAME = "yolo_crop_mask"
@@ -452,15 +458,20 @@ class CciYoloSegmentatorQWidget(QWidget):
 
     def _merge_tile_instances_one_pixel_boundary(self, pred_layer) -> np.ndarray:
         instances = pred_layer.metadata.get("yolo_tile_instances")
+        image_size, overlap = self._tiling_metadata(pred_layer)
         if instances:
             return merge_tile_instances_one_pixel_boundary(
                 instances=instances,
                 shape=np.asarray(pred_layer.data).shape,
-                image_size=self.TILING_THRESHOLD,
-                overlap=OVERLAP,
+                image_size=image_size,
+                overlap=overlap,
             )
 
-        return self._merge_segments_one_pixel_boundary(np.asarray(pred_layer.data))
+        return merge_segments_one_pixel_boundary(
+            np.asarray(pred_layer.data),
+            image_size=image_size,
+            overlap=overlap,
+        )
 
     def _merge_segments_iou(self, pred_layer) -> np.ndarray | None:
         instances = pred_layer.metadata.get("yolo_tile_instances")
@@ -473,7 +484,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         return merge_segments_iou(
             instances=instances,
             shape=np.asarray(pred_layer.data).shape,
-            iou_threshold=0.4,
+            iou_threshold=MERGE_IOU_THRESHOLD,
         )
 
     def _get_latest_segments_layer(self):
@@ -494,6 +505,9 @@ class CciYoloSegmentatorQWidget(QWidget):
     def _next_merged_layer_name(self, method: str) -> str:
         method_name = self._sanitize_stem(method).lower()
         prefix = f"{self.MERGED_LAYER_PREFIX}_{method_name}"
+        return self._next_numbered_layer_name(prefix)
+
+    def _next_numbered_layer_name(self, prefix: str) -> str:
         existing_names = {getattr(layer, "name", "") for layer in self.napari_viewer.layers}
         index = 1
         while True:
@@ -501,6 +515,39 @@ class CciYoloSegmentatorQWidget(QWidget):
             if name not in existing_names:
                 return name
             index += 1
+
+    def _add_tile_grid_layer(self, image_shape: tuple[int, int], image_size: int, overlap: int) -> None:
+        height, width = image_shape
+        chunk_size = image_size - (2 * overlap)
+        lines = []
+
+        for x in range(chunk_size, width, chunk_size):
+            lines.append(np.array([[0, x], [height - 1, x]], dtype=float))
+        for y in range(chunk_size, height, chunk_size):
+            lines.append(np.array([[y, 0], [y, width - 1]], dtype=float))
+
+        if not lines:
+            return
+
+        name = self._next_numbered_layer_name(self.TILE_GRID_LAYER_PREFIX)
+        layer = self.napari_viewer.add_shapes(
+            lines,
+            name=name,
+            shape_type="path",
+            edge_width=1,
+            edge_color="magenta",
+            face_color="transparent",
+        )
+        layer.metadata["tile_size"] = image_size
+        layer.metadata["overlap"] = overlap
+        layer.metadata["chunk_size"] = chunk_size
+
+    @staticmethod
+    def _tiling_metadata(layer) -> tuple[int, int]:
+        metadata = getattr(layer, "metadata", {}) or {}
+        image_size = int(metadata.get("tile_size", TILE_SIZE))
+        overlap = int(metadata.get("overlap", OVERLAP))
+        return image_size, overlap
 
     def _get_annotation_layer(self, mask_shape: tuple[int, int]):
         pred_layer = self._get_latest_segments_layer()
@@ -867,6 +914,78 @@ class CciYoloSegmentatorQWidget(QWidget):
                 return layer
         return None
 
+    @staticmethod
+    def _result_to_labels_mask(result, shape: tuple[int, int]) -> np.ndarray | None:
+        if result is None or result.masks is None:
+            return None
+
+        masks_data = getattr(result.masks, "data", None)
+        if masks_data is None:
+            return None
+
+        masks = masks_data.cpu().numpy()
+        if len(masks) == 0:
+            return np.zeros(shape, dtype=np.uint32)
+
+        labels = np.zeros(shape, dtype=np.uint32)
+        confidence_map = np.full(shape, -np.inf, dtype=float)
+        confs = np.ones(len(masks), dtype=float)
+        boxes = getattr(result, "boxes", None)
+        if boxes is not None and getattr(boxes, "conf", None) is not None:
+            confs = boxes.conf.cpu().numpy().astype(float)
+
+        for mask_index, mask_data in enumerate(masks):
+            mask_bool = mask_data > 0.5
+            if mask_bool.shape != shape:
+                mask_img = Image.fromarray(mask_bool.astype(np.uint8) * 255)
+                nearest = getattr(getattr(Image, "Resampling", Image), "NEAREST")
+                mask_img = mask_img.resize((shape[1], shape[0]), resample=nearest)
+                mask_bool = np.asarray(mask_img) > 0
+
+            confidence = float(confs[mask_index]) if mask_index < len(confs) else 1.0
+            update = mask_bool & (confidence >= confidence_map)
+            labels[update] = mask_index + 1
+            confidence_map[update] = confidence
+
+        return labels
+
+    @staticmethod
+    def _result_to_bbox_rectangles(result) -> list[np.ndarray]:
+        boxes = getattr(result, "boxes", None)
+        if result is None or boxes is None or getattr(boxes, "xyxy", None) is None:
+            return []
+
+        rects = []
+        for x1, y1, x2, y2 in boxes.xyxy.cpu().numpy():
+            rects.append(np.array([[y1, x1], [y1, x2], [y2, x2], [y2, x1]], dtype=float))
+        return rects
+
+    @staticmethod
+    def _instances_to_bbox_rectangles(instances) -> list[np.ndarray]:
+        rects = []
+        for instance in instances:
+            y0, y1, x0, x1 = instance.detection_bbox or instance.bbox
+            rects.append(np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]], dtype=float))
+        return rects
+
+    def _add_bbox_layer(self, rects: list[np.ndarray]) -> None:
+        existing = self._get_layer_by_name(self.BBOX_LAYER_NAME)
+        if existing is not None:
+            self.napari_viewer.layers.remove(existing)
+
+        if not rects:
+            return
+
+        layer = self.napari_viewer.add_shapes(
+            rects,
+            name=self.BBOX_LAYER_NAME,
+            shape_type="rectangle",
+            edge_width=2,
+            edge_color="cyan",
+            face_color="transparent",
+        )
+        layer.metadata["prediction_role"] = "bbox_reference"
+
     def _on_predict(self) -> None:
         if self._yolo is None:
             self._show_error("Load a model first.")
@@ -887,10 +1006,18 @@ class CciYoloSegmentatorQWidget(QWidget):
 
         image_u8 = self._normalize_to_uint8(image_data)
         tiled_mask = None
+        labels_mask = None
         tile_instances = []
+        bbox_rects = []
+        tile_size = self.TILING_THRESHOLD
+        overlap = OVERLAP
+        if overlap * 2 >= tile_size:
+            self._show_error("Tiling overlap must be smaller than half the tile size.")
+            return
+
         try:
             height, width = image_u8.shape[:2]
-            if height > self.TILING_THRESHOLD or width > self.TILING_THRESHOLD:
+            if height > tile_size or width > tile_size:
                 if self._model_path is None:
                     self._show_error("Load a model first.")
                     return
@@ -898,46 +1025,44 @@ class CciYoloSegmentatorQWidget(QWidget):
                 tiled_mask, tile_instances = predict_instances_with_yolo_tiling(
                     image_data=self._to_grayscale(image_u8),
                     model_path=str(self._model_path),
-                    image_size=self.TILING_THRESHOLD,
+                    image_size=tile_size,
+                    overlap=overlap,
+                    iou=YOLO_IOU,
+                    mask_padding=YOLO_MASK_PADDING,
                 )
                 result = None
-                polygons = []
+                bbox_rects = self._instances_to_bbox_rectangles(tile_instances)
             else:
                 image_rgb = self._to_pil_rgb(image_u8)
-                prediction = self._yolo.predict(image_rgb)
+                prediction = self._yolo.predict(
+                    image_rgb,
+                    imgsz=tile_size,
+                    retina_masks=True,
+                    verbose=False,
+                    iou=YOLO_IOU,
+                    predictor=create_padded_segmentation_predictor(YOLO_MASK_PADDING),
+                )
                 result = prediction[0] if len(prediction) else None
-
-                polygons = []
-                if result is not None and result.masks is not None and getattr(result.masks, "xy", None) is not None:
-                    for points in result.masks.xy:
-                        if len(points) < 3:
-                            continue
-                        poly_xy = np.asarray(points, dtype=float)
-                        polygons.append(np.column_stack((poly_xy[:, 1], poly_xy[:, 0])))
+                labels_mask = self._result_to_labels_mask(result, image_u8.shape[:2])
+                bbox_rects = self._result_to_bbox_rectangles(result)
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard
             self._show_error(f"Prediction failed: {exc}")
             return
 
-        rects = []
-        if not polygons and result is not None and result.boxes is not None:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            for x1, y1, x2, y2 in boxes:
-                rects.append(np.array([[y1, x1], [y1, x2], [y2, x2], [y2, x1]], dtype=float))
-
         existing = self._get_layer_by_name(self.PRED_LAYER_NAME)
         if existing is not None:
             self.napari_viewer.layers.remove(existing)
+        self._add_bbox_layer(bbox_rects)
 
-        if polygons:
-            self.napari_viewer.add_shapes(
-                polygons,
+        if labels_mask is not None:
+            pred_layer = self.napari_viewer.add_labels(
+                labels_mask,
                 name=self.PRED_LAYER_NAME,
-                shape_type="polygon",
-                edge_width=2,
-                edge_color="yellow",
-                face_color="transparent",
             )
-            self._show_info(f"Prediction done: {len(polygons)} segment(s).")
+            pred_layer.metadata["prediction_mode"] = "single_image"
+            pred_layer.metadata["yolo_iou_threshold"] = YOLO_IOU
+            pred_layer.metadata["yolo_mask_padding"] = YOLO_MASK_PADDING
+            self._show_info(f"Prediction done: {int(labels_mask.max())} segment(s).")
             return
 
         if result is None and tiled_mask is not None:
@@ -946,22 +1071,20 @@ class CciYoloSegmentatorQWidget(QWidget):
                 name=self.PRED_LAYER_NAME,
             )
             pred_layer.metadata["yolo_tile_instances"] = tile_instances
-            pred_layer.metadata["yolo_iou_threshold"] = 0.4
+            pred_layer.metadata["yolo_iou_threshold"] = YOLO_IOU
+            pred_layer.metadata["yolo_mask_padding"] = YOLO_MASK_PADDING
+            pred_layer.metadata["merge_iou_threshold"] = MERGE_IOU_THRESHOLD
+            pred_layer.metadata["tile_size"] = tile_size
+            pred_layer.metadata["overlap"] = overlap
+            pred_layer.metadata["chunk_size"] = tile_size - (2 * overlap)
+            self._add_tile_grid_layer(tiled_mask.shape, tile_size, overlap)
             self._show_info(
                 "Large image prediction done. "
                 "Use Merge Segments to merge labels across tile boundaries."
             )
             return
 
-        self.napari_viewer.add_shapes(
-            rects,
-            name=self.PRED_LAYER_NAME,
-            shape_type="rectangle",
-            edge_width=2,
-            edge_color="yellow",
-            face_color="transparent",
-        )
-        self._show_info(f"Prediction done: {len(rects)} bbox fallback(s).")
+        self._show_info(f"Prediction done: no segmentation masks, {len(bbox_rects)} bbox fallback(s).")
 
     def _on_retrain(self) -> None:
         if self._yolo is None or self._model_path is None:
