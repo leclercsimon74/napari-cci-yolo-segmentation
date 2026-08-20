@@ -37,24 +37,25 @@ def test_calculate_chunk_size_rejects_overlap_half_tile_or_larger():
         mod.LargeImageYoloSegmenter.calculate_chunk_size(image_size=1024, overlap=512)
 
 
-def test_render_instances_central_regions_respects_overlap():
+def test_one_pixel_boundary_merge_links_labels_touching_across_chunks():
     mod = _load_tiling_module()
 
-    instance = mod.TileInstance(
-        label_id=7,
-        confidence=1.0,
-        tile_origin=(-2, -2),
-        bbox=(0, 5, 0, 5),
-        mask=np.ones((5, 5), dtype=bool),
+    segment_results = np.array(
+        [
+            [0, 7, 9, 0],
+            [0, 7, 9, 0],
+            [0, 0, 0, 0],
+            [3, 0, 0, 4],
+        ],
+        dtype=np.uint32,
     )
 
-    rendered = mod.LargeImageYoloSegmenter.render_instances_central_regions(
-        [instance],
-        shape=(8, 8),
+    merged = mod.merge_segments_one_pixel_boundary(
+        segment_results,
         image_size=6,
         overlap=2,
     )
 
-    assert np.all(rendered[:2, :2] == 7)
-    assert np.all(rendered[2:, :] == 0)
-    assert np.all(rendered[:, 2:] == 0)
+    assert np.all(merged[:2, 1:3] == 7)
+    assert merged[3, 0] == 3
+    assert merged[3, 3] == 4

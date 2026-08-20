@@ -19,7 +19,6 @@ from qtpy.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
-    QComboBox,
 )
 
 from skimage.measure import find_contours
@@ -31,12 +30,10 @@ from ._segmentation_training import (
     run_retraining_pipeline,
 )
 from .yolo_tiling_segmentation import (
-    MERGE_IOU_THRESHOLD,
     YOLO_IOU,
-    merge_segments_iou,
     merge_segments_one_pixel_boundary,
-    merge_tile_instances_one_pixel_boundary,
-    predict_instances_with_yolo_tiling,
+    predict_segments_and_bboxes_with_yolo_tiling,
+    predict_segments_with_yolo_tiling,
 )
 
 OVERLAP = 108  # pixels of overlap for tiling segmentation
@@ -91,6 +88,7 @@ class CciYoloSegmentatorQWidget(QWidget):
     CROP_IMAGE_LAYER_NAME = "yolo_crop_image"
     CROP_MASK_LAYER_NAME = "yolo_crop_mask"
     TILING_THRESHOLD = TILE_SIZE
+    show_bbox = True
 
     def __init__(self, napari_viewer):
         super().__init__()
@@ -122,11 +120,8 @@ class CciYoloSegmentatorQWidget(QWidget):
         predict_button = QPushButton("Predict Large Image")
         predict_button.clicked.connect(self._on_predict)
 
-        self.merge_button = QComboBox()
-        self.merge_button.addItems(["One pixel boundary", "IoU"])
-
-        merge_action_button = QPushButton("Merge Segments")
-        merge_action_button.clicked.connect(self._on_merge_segments)
+        merge_button = QPushButton("Merge Segments")
+        merge_button.clicked.connect(self._on_merge_segments)
 
         select_crop_button = QPushButton("Select Crop")
         select_crop_button.clicked.connect(self._on_select_crop)
@@ -153,9 +148,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         row_model.addWidget(browse_button)
 
         row_merging = QHBoxLayout()
-        row_merging.addWidget(QLabel("Merging"))
-        row_merging.addWidget(self.merge_button)
-        row_merging.addWidget(merge_action_button)
+        row_merging.addWidget(merge_button)
 
         row_crop = QHBoxLayout()
         row_crop.addWidget(select_crop_button)
@@ -290,24 +283,38 @@ class CciYoloSegmentatorQWidget(QWidget):
             )
 
     def _on_new_crop(self) -> None:
-        # generate a new crop from the selection (from _on_select_crop)
-        # Should copy both the image layer AND the shape layer. The shape layer need to be converted as segmentation mask.
-        image_layer = self._get_active_image_layer()
-        if image_layer is None:
-            return
-
         selection_layer = self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME)
         if selection_layer is None or len(selection_layer.data) == 0:
             self._show_error("Create a crop selection first.")
             return
 
+        image_layer = self._get_crop_source_image_layer(selection_layer)
+        if image_layer is None:
+            return
+
         image_data = np.asarray(image_layer.data)
         if image_data.ndim not in {2, 3}:
-            self._show_error("Active image must be 2D or RGB.")
+            self._show_error("Source image must be 2D or RGB.")
             return
 
         if image_data.ndim == 3 and image_data.shape[-1] > 3:
             image_data = image_data[..., :3]
+
+        segmentation_layer = self._get_latest_segments_layer()
+        if segmentation_layer is None:
+            self._show_error("No segmentation layer found to crop.")
+            return
+
+        segmentation_data = np.asarray(segmentation_layer.data)
+        if segmentation_data.ndim != 2:
+            self._show_error("Segmentation layer must be a 2D labels layer.")
+            return
+        if segmentation_data.shape != image_data.shape[:2]:
+            self._show_error(
+                "Source image and segmentation shapes do not match: "
+                f"image={image_data.shape[:2]}, segmentation={segmentation_data.shape}."
+            )
+            return
 
         try:
             y0, y1, x0, x1 = self._crop_bounds_from_selection(
@@ -320,34 +327,10 @@ class CciYoloSegmentatorQWidget(QWidget):
             return
 
         crop_image = self._normalize_to_uint8(image_data[y0:y1, x0:x1])
-        crop_mask = np.zeros(crop_image.shape[:2], dtype=np.uint16)
-
-        annotation_layer = self._get_annotation_layer(tuple(image_data.shape[:2]))
-        if annotation_layer is not None and self._is_shapes_like_layer(annotation_layer):
-            try:
-                full_mask = self._build_instance_mask(
-                    annotation_layer,
-                    tuple(image_data.shape[:2]),
-                )
-                crop_mask = full_mask[y0:y1, x0:x1]
-            except ValueError as exc:
-                if "No shapes found" not in str(exc):
-                    self._show_error(f"Could not convert shapes to crop mask: {exc}")
-                    return
-            except Exception as exc:  # noqa: BLE001
-                self._show_error(f"Could not convert shapes to crop mask: {exc}")
-                return
-        elif annotation_layer is not None:
-            crop_mask = np.asarray(annotation_layer.data)[y0:y1, x0:x1].astype(
-                np.uint16,
-                copy=False,
-            )
+        crop_mask = segmentation_data[y0:y1, x0:x1].astype(np.uint16, copy=False)
 
         self._hide_existing_crop_layers()
-        self._crop_source_layers = [image_layer]
-        if annotation_layer is not None and annotation_layer is not selection_layer:
-            self._crop_source_layers.append(annotation_layer)
-        self._crop_source_layers.append(selection_layer)
+        self._crop_source_layers = [image_layer, segmentation_layer, selection_layer]
 
         for layer in self._crop_source_layers:
             layer.visible = False
@@ -362,11 +345,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         )
         crop_image_layer.metadata["source_image_layer_name"] = image_layer.name
         crop_image_layer.metadata["crop_bounds_yx"] = (y0, y1, x0, x1)
-        crop_mask_layer.metadata["source_shapes_layer_name"] = (
-            getattr(annotation_layer, "name", None)
-            if annotation_layer is not None and annotation_layer is not selection_layer
-            else None
-        )
+        crop_mask_layer.metadata["source_segmentation_layer_name"] = segmentation_layer.name
         crop_mask_layer.metadata["crop_bounds_yx"] = (y0, y1, x0, x1)
 
         self.napari_viewer.layers.selection.active = crop_mask_layer
@@ -402,6 +381,17 @@ class CciYoloSegmentatorQWidget(QWidget):
             if layer is not None:
                 self.napari_viewer.layers.remove(layer)
 
+    def _get_crop_source_image_layer(self, selection_layer):
+        source_name = selection_layer.metadata.get("source_image_layer_name")
+        if source_name:
+            source_layer = self._get_layer_by_name(source_name)
+            if source_layer is not None and self._is_candidate_image_layer(source_layer):
+                data = np.asarray(source_layer.data)
+                if data.ndim >= 2:
+                    return source_layer
+
+        return self._get_active_image_layer()
+
     def _current_view_center(self, height: int, width: int) -> tuple[float, float]:
         center = getattr(getattr(self.napari_viewer, "camera", None), "center", None)
         if center is None:
@@ -411,7 +401,7 @@ class CciYoloSegmentatorQWidget(QWidget):
             return float(center[-2]), float(center[-1])
         return height / 2.0, width / 2.0
 
-    def _merge_segments(self, method: str) -> None:
+    def _merge_segments(self) -> None:
         pred_layer = self._get_latest_segments_layer()
         if pred_layer is None:
             self._show_error("No prediction layer found to merge.")
@@ -422,67 +412,33 @@ class CciYoloSegmentatorQWidget(QWidget):
             self._show_error("Prediction layer must be a 2D labels layer.")
             return
 
-        if method == "One pixel boundary":
-            merged_mask = self._merge_tile_instances_one_pixel_boundary(pred_layer)
-        elif method == "IoU":
-            merged_mask = self._merge_segments_iou(pred_layer)
-        else:
-            self._show_error(f"Unknown merging method: {method}")
-            return
+        image_size, overlap = self._tiling_metadata(pred_layer)
+        merged_mask = merge_segments_one_pixel_boundary(
+            pred_data,
+            image_size=image_size,
+            overlap=overlap,
+        )
 
-        if merged_mask is None:
-            return
-
-        layer_name = self._next_merged_layer_name(method)
+        merge_method = "One pixel boundary"
+        layer_name = self._next_merged_layer_name(merge_method)
         merged_layer = self.napari_viewer.add_labels(
             merged_mask,
             name=layer_name,
         )
         merged_layer.metadata.update(pred_layer.metadata)
-        merged_layer.metadata["merge_method"] = method
+        merged_layer.metadata["merge_method"] = merge_method
         merged_layer.metadata["merge_source_layer_name"] = pred_layer.name
         self.napari_viewer.layers.selection.active = merged_layer
-        self._show_info(f"Merged segments using method: {method}. Created layer: {layer_name}")
+        self._show_info(f"Merged segments using one-pixel boundary. Created layer: {layer_name}")
 
     def _on_merge_segments(self) -> None:
-        self._merge_segments(self.merge_button.currentText())
+        self._merge_segments()
 
     def _merge_segments_one_pixel_boundary(self, pred_data: np.ndarray) -> np.ndarray:
         return merge_segments_one_pixel_boundary(
             pred_data,
             image_size=self.TILING_THRESHOLD,
             overlap=OVERLAP,
-        )
-
-    def _merge_tile_instances_one_pixel_boundary(self, pred_layer) -> np.ndarray:
-        instances = pred_layer.metadata.get("yolo_tile_instances")
-        image_size, overlap = self._tiling_metadata(pred_layer)
-        if instances:
-            return merge_tile_instances_one_pixel_boundary(
-                instances=instances,
-                shape=np.asarray(pred_layer.data).shape,
-                image_size=image_size,
-                overlap=overlap,
-            )
-
-        return merge_segments_one_pixel_boundary(
-            np.asarray(pred_layer.data),
-            image_size=image_size,
-            overlap=overlap,
-        )
-
-    def _merge_segments_iou(self, pred_layer) -> np.ndarray | None:
-        instances = pred_layer.metadata.get("yolo_tile_instances")
-        if not instances:
-            self._show_error(
-                "IoU merging requires a large-image prediction created by this session."
-            )
-            return None
-
-        return merge_segments_iou(
-            instances=instances,
-            shape=np.asarray(pred_layer.data).shape,
-            iou_threshold=MERGE_IOU_THRESHOLD,
         )
 
     def _get_latest_segments_layer(self):
@@ -900,8 +856,12 @@ class CciYoloSegmentatorQWidget(QWidget):
             return False
         if getattr(layer, "data", None) is None:
             return False
-        return getattr(layer, "name", None) not in {
+        name = getattr(layer, "name", None)
+        if name is not None and name.startswith(f"{self.MERGED_LAYER_PREFIX}_"):
+            return False
+        return name not in {
             self.PRED_LAYER_NAME,
+            self.BBOX_LAYER_NAME,
             self.CROP_SELECTION_LAYER_NAME,
             self.CROP_MASK_LAYER_NAME,
         }
@@ -959,10 +919,9 @@ class CciYoloSegmentatorQWidget(QWidget):
         return rects
 
     @staticmethod
-    def _instances_to_bbox_rectangles(instances) -> list[np.ndarray]:
+    def _bboxes_to_rectangles(bboxes: list[tuple[int, int, int, int]]) -> list[np.ndarray]:
         rects = []
-        for instance in instances:
-            y0, y1, x0, x1 = instance.detection_bbox or instance.bbox
+        for y0, y1, x0, x1 in bboxes:
             rects.append(np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]], dtype=float))
         return rects
 
@@ -1005,7 +964,6 @@ class CciYoloSegmentatorQWidget(QWidget):
         image_u8 = self._normalize_to_uint8(image_data)
         tiled_mask = None
         labels_mask = None
-        tile_instances = []
         bbox_rects = []
         tile_size = self.TILING_THRESHOLD
         overlap = OVERLAP
@@ -1020,15 +978,25 @@ class CciYoloSegmentatorQWidget(QWidget):
                     self._show_error("Load a model first.")
                     return
 
-                tiled_mask, tile_instances = predict_instances_with_yolo_tiling(
-                    image_data=self._to_grayscale(image_u8),
-                    model_path=str(self._model_path),
-                    image_size=tile_size,
-                    overlap=overlap,
-                    iou=YOLO_IOU,
-                )
+                image_gray = self._to_grayscale(image_u8)
+                if self.show_bbox:
+                    tiled_mask, bboxes = predict_segments_and_bboxes_with_yolo_tiling(
+                        image_data=image_gray,
+                        model_path=str(self._model_path),
+                        image_size=tile_size,
+                        overlap=overlap,
+                        iou=YOLO_IOU,
+                    )
+                    bbox_rects = self._bboxes_to_rectangles(bboxes)
+                else:
+                    tiled_mask = predict_segments_with_yolo_tiling(
+                        image_data=image_gray,
+                        model_path=str(self._model_path),
+                        image_size=tile_size,
+                        overlap=overlap,
+                        iou=YOLO_IOU,
+                    )
                 result = None
-                bbox_rects = self._instances_to_bbox_rectangles(tile_instances)
             else:
                 image_rgb = self._to_pil_rgb(image_u8)
                 prediction = self._yolo.predict(
@@ -1040,7 +1008,8 @@ class CciYoloSegmentatorQWidget(QWidget):
                 )
                 result = prediction[0] if len(prediction) else None
                 labels_mask = self._result_to_labels_mask(result, image_u8.shape[:2])
-                bbox_rects = self._result_to_bbox_rectangles(result)
+                if self.show_bbox:
+                    bbox_rects = self._result_to_bbox_rectangles(result)
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard
             self._show_error(f"Prediction failed: {exc}")
             return
@@ -1065,9 +1034,7 @@ class CciYoloSegmentatorQWidget(QWidget):
                 tiled_mask,
                 name=self.PRED_LAYER_NAME,
             )
-            pred_layer.metadata["yolo_tile_instances"] = tile_instances
             pred_layer.metadata["yolo_iou_threshold"] = YOLO_IOU
-            pred_layer.metadata["merge_iou_threshold"] = MERGE_IOU_THRESHOLD
             pred_layer.metadata["tile_size"] = tile_size
             pred_layer.metadata["overlap"] = overlap
             pred_layer.metadata["chunk_size"] = tile_size - (2 * overlap)
