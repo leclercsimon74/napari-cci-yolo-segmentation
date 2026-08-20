@@ -11,121 +11,7 @@ import skimage.color
 import skimage.segmentation
 
 YOLO_IOU = 0.4
-YOLO_MASK_SIDE_PADDING = 10
-YOLO_MASK_SIDE_HIT_MARGIN = 2
-YOLO_MASK_PADDING = YOLO_MASK_SIDE_PADDING
 MERGE_IOU_THRESHOLD = 0.4
-
-
-def create_padded_segmentation_predictor(
-    mask_padding: int | float = YOLO_MASK_PADDING,
-    hit_margin: int = YOLO_MASK_SIDE_HIT_MARGIN,
-):
-    try:
-        from ultralytics.engine.results import Results
-        from ultralytics.models.yolo.segment import SegmentationPredictor
-        from ultralytics.utils import ops
-    except ModuleNotFoundError as exc:
-        if exc.name == "ultralytics":
-            raise RuntimeError(
-                "Ultralytics is not installed in the Python environment "
-                "running napari."
-            ) from exc
-        raise
-
-    class PaddedSegmentationPredictor(SegmentationPredictor):
-        @staticmethod
-        def _expand_boxes_on_mask_hits(masks, boxes, image_shape):
-            height, width = image_shape
-            side_padding = int(round(mask_padding))
-            margin = max(1, int(hit_margin))
-            if side_padding <= 0:
-                return boxes
-
-            expanded = boxes.clone()
-            for mask_index in range(masks.shape[0]):
-                mask = masks[mask_index].bool()
-                x0, y0, x1, y1 = boxes[mask_index]
-                ix0 = max(0, min(width, int(x0.floor().item())))
-                iy0 = max(0, min(height, int(y0.floor().item())))
-                ix1 = max(0, min(width, int(x1.ceil().item())))
-                iy1 = max(0, min(height, int(y1.ceil().item())))
-                if ix1 <= ix0 or iy1 <= iy0:
-                    continue
-
-                left_x1 = min(ix1, ix0 + margin)
-                right_x0 = max(ix0, ix1 - margin)
-                top_y1 = min(iy1, iy0 + margin)
-                bottom_y0 = max(iy0, iy1 - margin)
-
-                if mask[iy0:iy1, ix0:left_x1].any().item():
-                    expanded[mask_index, 0] -= side_padding
-                if mask[iy0:iy1, right_x0:ix1].any().item():
-                    expanded[mask_index, 2] += side_padding
-                if mask[iy0:top_y1, ix0:ix1].any().item():
-                    expanded[mask_index, 1] -= side_padding
-                if mask[bottom_y0:iy1, ix0:ix1].any().item():
-                    expanded[mask_index, 3] += side_padding
-
-            expanded[:, 0].clamp_(0, width)
-            expanded[:, 2].clamp_(0, width)
-            expanded[:, 1].clamp_(0, height)
-            expanded[:, 3].clamp_(0, height)
-            return expanded
-
-        def construct_result(self, pred, img, orig_img, img_path, proto):
-            if pred.shape[0] == 0:
-                masks = None
-            elif self.args.retina_masks:
-                pred[:, :4] = ops.scale_boxes(
-                    img.shape[2:],
-                    pred[:, :4],
-                    orig_img.shape,
-                )
-
-                mask_boxes = pred[:, :4]
-                masks = ops.process_mask_native(
-                    proto,
-                    pred[:, 6:],
-                    mask_boxes,
-                    orig_img.shape[:2],
-                )
-                expanded_boxes = self._expand_boxes_on_mask_hits(
-                    masks,
-                    mask_boxes,
-                    orig_img.shape[:2],
-                )
-                if not expanded_boxes.equal(mask_boxes):
-                    masks = ops.process_mask_native(
-                        proto,
-                        pred[:, 6:],
-                        expanded_boxes,
-                        orig_img.shape[:2],
-                    )
-            else:
-                masks = ops.process_mask(
-                    proto,
-                    pred[:, 6:],
-                    pred[:, :4],
-                    img.shape[2:],
-                    upsample=True,
-                )
-
-                pred[:, :4] = ops.scale_boxes(
-                    img.shape[2:],
-                    pred[:, :4],
-                    orig_img.shape,
-                )
-
-            return Results(
-                orig_img,
-                path=img_path,
-                names=self.model.names,
-                boxes=pred[:, :6],
-                masks=masks,
-            )
-
-    return PaddedSegmentationPredictor
 
 
 def _normalize_to_uint8(image_data):
@@ -238,12 +124,10 @@ class YoloSegmenter:
         model_path: str,
         image_size: int,
         iou: float = YOLO_IOU,
-        mask_padding: float = YOLO_MASK_PADDING,
     ):
         self.model_mutex = threading.Lock()
         self.image_size = image_size
         self.iou = iou
-        self.predictor_cls = create_padded_segmentation_predictor(mask_padding)
         self.int_gen = IntGenerator()
         self.model = self._create_model(model_path)
 
@@ -271,7 +155,6 @@ class YoloSegmenter:
                 retina_masks=True,
                 verbose=False,
                 iou=self.iou,
-                predictor=self.predictor_cls,
             )
 
         all_masks = np.zeros(shape=data.shape, dtype=np.uint32)
@@ -311,7 +194,6 @@ class YoloSegmenter:
                 retina_masks=True,
                 verbose=False,
                 iou=self.iou,
-                predictor=self.predictor_cls,
             )
 
         if result is None or result[0].masks is None:
@@ -741,14 +623,8 @@ def segment_with_yolo_tiling(
     overlap: int = 100,
     clear_borders: bool = False,
     iou: float = YOLO_IOU,
-    mask_padding: float = YOLO_MASK_PADDING,
 ):
-    yolo_segmenter = YoloSegmenter(
-        model_path=model_path,
-        image_size=image_size,
-        iou=iou,
-        mask_padding=mask_padding,
-    )
+    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
     segmenter = LargeImageYoloSegmenter()
     return segmenter.segment_large_image_data(
         yolo_segmenter=yolo_segmenter,
@@ -764,14 +640,8 @@ def predict_segments_with_yolo_tiling(
     image_size: int = 1024,
     overlap: int = 100,
     iou: float = YOLO_IOU,
-    mask_padding: float = YOLO_MASK_PADDING,
 ):
-    yolo_segmenter = YoloSegmenter(
-        model_path=model_path,
-        image_size=image_size,
-        iou=iou,
-        mask_padding=mask_padding,
-    )
+    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
     segmenter = LargeImageYoloSegmenter()
     return segmenter.predict_segments(
         yolo_segmenter=yolo_segmenter,
@@ -786,15 +656,9 @@ def predict_instances_with_yolo_tiling(
     image_size: int = 1024,
     overlap: int = 100,
     iou: float = YOLO_IOU,
-    mask_padding: float = YOLO_MASK_PADDING,
 ):
     image_data = _normalize_to_uint8(image_data)
-    yolo_segmenter = YoloSegmenter(
-        model_path=model_path,
-        image_size=image_size,
-        iou=iou,
-        mask_padding=mask_padding,
-    )
+    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
     segmenter = LargeImageYoloSegmenter()
     instances = segmenter.predict_instances(
         yolo_segmenter=yolo_segmenter,

@@ -32,9 +32,7 @@ from ._segmentation_training import (
 )
 from .yolo_tiling_segmentation import (
     MERGE_IOU_THRESHOLD,
-    YOLO_MASK_PADDING,
     YOLO_IOU,
-    create_padded_segmentation_predictor,
     merge_segments_iou,
     merge_segments_one_pixel_boundary,
     merge_tile_instances_one_pixel_boundary,
@@ -1028,7 +1026,6 @@ class CciYoloSegmentatorQWidget(QWidget):
                     image_size=tile_size,
                     overlap=overlap,
                     iou=YOLO_IOU,
-                    mask_padding=YOLO_MASK_PADDING,
                 )
                 result = None
                 bbox_rects = self._instances_to_bbox_rectangles(tile_instances)
@@ -1040,7 +1037,6 @@ class CciYoloSegmentatorQWidget(QWidget):
                     retina_masks=True,
                     verbose=False,
                     iou=YOLO_IOU,
-                    predictor=create_padded_segmentation_predictor(YOLO_MASK_PADDING),
                 )
                 result = prediction[0] if len(prediction) else None
                 labels_mask = self._result_to_labels_mask(result, image_u8.shape[:2])
@@ -1061,7 +1057,6 @@ class CciYoloSegmentatorQWidget(QWidget):
             )
             pred_layer.metadata["prediction_mode"] = "single_image"
             pred_layer.metadata["yolo_iou_threshold"] = YOLO_IOU
-            pred_layer.metadata["yolo_mask_padding"] = YOLO_MASK_PADDING
             self._show_info(f"Prediction done: {int(labels_mask.max())} segment(s).")
             return
 
@@ -1072,7 +1067,6 @@ class CciYoloSegmentatorQWidget(QWidget):
             )
             pred_layer.metadata["yolo_tile_instances"] = tile_instances
             pred_layer.metadata["yolo_iou_threshold"] = YOLO_IOU
-            pred_layer.metadata["yolo_mask_padding"] = YOLO_MASK_PADDING
             pred_layer.metadata["merge_iou_threshold"] = MERGE_IOU_THRESHOLD
             pred_layer.metadata["tile_size"] = tile_size
             pred_layer.metadata["overlap"] = overlap
