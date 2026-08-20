@@ -100,6 +100,39 @@ def test_mask_to_yolo_segmentation_lines_treats_components_as_objects_single_cla
     assert class_ids == {"0"}
 
 
+def test_mask_to_yolo_segmentation_lines_marks_edge_touching_objects():
+    mod = _load_training_module()
+
+    mask = np.zeros((32, 32), dtype=np.uint16)
+    mask[0:8, 2:8] = 3
+    mask[16:24, 16:24] = 9
+
+    edge_touching_label_ids = mod._edge_touching_label_ids(mask)
+    lines = mod._mask_to_yolo_segmentation_lines(
+        mask,
+        edge_touching_label_ids=edge_touching_label_ids,
+    )
+
+    class_ids = {line.split()[0] for line in lines}
+    assert class_ids == {"0", "1"}
+
+
+def test_write_dataset_yaml_contains_edge_touching_class(tmp_path: Path):
+    mod = _load_training_module()
+
+    dataset_yaml = mod._write_dataset_yaml(
+        tmp_path,
+        {
+            mod.OBJECT_CLASS_ID: "object",
+            mod.EDGE_TOUCHING_CLASS_ID: "edge_touching",
+        },
+    )
+
+    text = dataset_yaml.read_text(encoding="utf-8")
+    assert "  0: object\n" in text
+    assert "  1: edge_touching\n" in text
+
+
 def test_preprocess_training_mask_labels_binary_components_after_opening():
     mod = _load_training_module()
 

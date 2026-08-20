@@ -9,7 +9,7 @@ import numpy as np
 import skimage.color
 import skimage.segmentation
 
-YOLO_IOU = 0.4
+from . import config
 
 
 def _normalize_to_uint8(image_data):
@@ -111,7 +111,7 @@ class YoloSegmenter:
         self,
         model_path: str,
         image_size: int,
-        iou: float = YOLO_IOU,
+        iou: float = config.YOLO_IOU,
     ):
         self.model_mutex = threading.Lock()
         self.image_size = image_size
@@ -165,42 +165,6 @@ class YoloSegmenter:
             )
 
         return all_masks
-
-    def predict_tile_bboxes(
-        self,
-        data,
-        global_y0: int,
-        global_x0: int,
-        output_shape: tuple[int, int],
-    ) -> list[tuple[int, int, int, int]]:
-        with self.model_mutex:
-            rgb_data = skimage.color.gray2rgb(data)
-            input_data = np.ascontiguousarray(rgb_data)
-            result = self.model.predict(
-                source=input_data,
-                imgsz=self.image_size,
-                retina_masks=True,
-                verbose=False,
-                iou=self.iou,
-            )
-
-        if result is None:
-            return []
-
-        boxes = getattr(result[0], "boxes", None)
-        if boxes is None or getattr(boxes, "xyxy", None) is None:
-            return []
-
-        output_height, output_width = output_shape
-        bboxes = []
-        for box_x0, box_y0, box_x1, box_y1 in boxes.xyxy.cpu().numpy():
-            y0 = max(0, int(round(box_y0 + global_y0)))
-            y1 = min(output_height, int(round(box_y1 + global_y0)))
-            x0 = max(0, int(round(box_x0 + global_x0)))
-            x1 = min(output_width, int(round(box_x1 + global_x0)))
-            if y1 > y0 and x1 > x0:
-                bboxes.append((y0, y1, x0, x1))
-        return bboxes
 
 
 class LargeImageYoloSegmenter:
@@ -354,32 +318,6 @@ class LargeImageYoloSegmenter:
         result = segment_results.compute(scheduler="threads")
         return result[:original_height, :original_width]
 
-    def predict_bboxes(self, yolo_segmenter: YoloSegmenter, image_data, overlap=100):
-        chunk_size = self.calculate_chunk_size(yolo_segmenter.image_size, overlap)
-        padded_image, original_height, original_width = self._pad_to_chunk_grid(image_data, chunk_size)
-        bordered_image = np.pad(
-            padded_image,
-            ((overlap, overlap), (overlap, overlap)),
-            mode="reflect" if min(padded_image.shape[:2]) > 1 else "edge",
-        )
-
-        bboxes = []
-        for y0 in range(0, padded_image.shape[0], chunk_size):
-            for x0 in range(0, padded_image.shape[1], chunk_size):
-                tile = bordered_image[
-                    y0 : y0 + yolo_segmenter.image_size,
-                    x0 : x0 + yolo_segmenter.image_size,
-                ]
-                bboxes.extend(
-                    yolo_segmenter.predict_tile_bboxes(
-                        data=tile,
-                        global_y0=y0 - overlap,
-                        global_x0=x0 - overlap,
-                        output_shape=(original_height, original_width),
-                    )
-                )
-        return bboxes
-
     def merge_segments_one_pixel_boundary(
         self,
         segment_results,
@@ -478,7 +416,7 @@ def segment_with_yolo_tiling(
     image_size: int = 1024,
     overlap: int = 100,
     clear_borders: bool = False,
-    iou: float = YOLO_IOU,
+    iou: float = config.YOLO_IOU,
 ):
     yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
     segmenter = LargeImageYoloSegmenter()
@@ -495,7 +433,7 @@ def predict_segments_with_yolo_tiling(
     model_path: str,
     image_size: int = 1024,
     overlap: int = 100,
-    iou: float = YOLO_IOU,
+    iou: float = config.YOLO_IOU,
 ):
     yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
     segmenter = LargeImageYoloSegmenter()
@@ -504,45 +442,6 @@ def predict_segments_with_yolo_tiling(
         image_data=_normalize_to_uint8(image_data),
         overlap=overlap,
     )
-
-
-def predict_bboxes_with_yolo_tiling(
-    image_data,
-    model_path: str,
-    image_size: int = 1024,
-    overlap: int = 100,
-    iou: float = YOLO_IOU,
-):
-    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
-    segmenter = LargeImageYoloSegmenter()
-    return segmenter.predict_bboxes(
-        yolo_segmenter=yolo_segmenter,
-        image_data=_normalize_to_uint8(image_data),
-        overlap=overlap,
-    )
-
-
-def predict_segments_and_bboxes_with_yolo_tiling(
-    image_data,
-    model_path: str,
-    image_size: int = 1024,
-    overlap: int = 100,
-    iou: float = YOLO_IOU,
-):
-    image_data = _normalize_to_uint8(image_data)
-    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
-    segmenter = LargeImageYoloSegmenter()
-    labels = segmenter.predict_segments(
-        yolo_segmenter=yolo_segmenter,
-        image_data=image_data,
-        overlap=overlap,
-    )
-    bboxes = segmenter.predict_bboxes(
-        yolo_segmenter=yolo_segmenter,
-        image_data=image_data,
-        overlap=overlap,
-    )
-    return labels, bboxes
 
 
 def merge_segments_one_pixel_boundary(segment_results, image_size: int = 1024, overlap: int = 100, clear_borders: bool = False):

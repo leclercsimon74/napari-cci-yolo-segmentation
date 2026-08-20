@@ -14,7 +14,9 @@ from skimage.measure import find_contours, label
 from skimage.morphology import disk, opening
 
 
-IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+IMG_EXTENSIONS = {".png", ".tif", ".tiff"}
+OBJECT_CLASS_ID = 0
+EDGE_TOUCHING_CLASS_ID = 1
 
 
 class CCIYoloWrapper:
@@ -106,13 +108,15 @@ def run_retraining_pipeline(
     pairs = _collect_pairs(retrain_data_root)
     train_pairs, val_pairs = _split_pairs(pairs, cfg.val_ratio, cfg.seed)
 
-    # Single-class mode for now: all non-zero mask pixels belong to class_0.
+    # Training uses a separate class for objects touching the original image edge.
     has_foreground = _has_any_foreground(pairs)
     if not has_foreground:
         raise ValueError("No foreground classes found in masks. Masks must contain values > 0.")
 
-    class_map = {1: 0}
-    class_names = {0: "class_0"}
+    class_names = {
+        OBJECT_CLASS_ID: "object",
+        EDGE_TOUCHING_CLASS_ID: "edge_touching",
+    }
 
     _prepare_empty_dataset_folders(dataset_root)
 
@@ -123,8 +127,8 @@ def run_retraining_pipeline(
         "val_positive": 0,
     }
 
-    _write_split_tiles(train_pairs, dataset_root / "images" / "train", dataset_root / "labels" / "train", cfg.tile_size, class_map, stats, "train")
-    _write_split_tiles(val_pairs, dataset_root / "images" / "val", dataset_root / "labels" / "val", cfg.tile_size, class_map, stats, "val")
+    _write_split_tiles(train_pairs, dataset_root / "images" / "train", dataset_root / "labels" / "train", cfg.tile_size, stats, "train")
+    _write_split_tiles(val_pairs, dataset_root / "images" / "val", dataset_root / "labels" / "val", cfg.tile_size, stats, "val")
 
     if stats["train_positive"] == 0 or stats["val_positive"] == 0:
         raise ValueError(
@@ -268,7 +272,6 @@ def _write_split_tiles(
     images_out: Path,
     labels_out: Path,
     tile_size: int,
-    class_map: dict[int, int],
     stats: dict[str, int],
     split_name: str,
 ) -> None:
@@ -278,6 +281,7 @@ def _write_split_tiles(
     for pair in pairs:
         image = _read_image_rgb(pair.image_path)
         mask = _read_mask(pair.mask_path)
+        edge_touching_label_ids = _edge_touching_label_ids(mask)
 
         if image.shape[:2] != mask.shape[:2]:
             raise ValueError(
@@ -288,7 +292,7 @@ def _write_split_tiles(
             tile_img = _extract_and_pad_image_tile(image, y0, y1, x0, x1, tile_size)
             tile_mask = _extract_and_pad_mask_tile(mask, y0, y1, x0, x1, tile_size)
 
-            yolo_lines = _mask_to_yolo_segmentation_lines(tile_mask, class_map)
+            yolo_lines = _mask_to_yolo_segmentation_lines(tile_mask, edge_touching_label_ids=edge_touching_label_ids)
             has_positive = len(yolo_lines) > 0
             if not has_positive and (tile_index % keep_empty_every != 0):
                 tile_index += 1
@@ -346,16 +350,29 @@ def _extract_and_pad_mask_tile(mask: np.ndarray, y0: int, y1: int, x0: int, x1: 
     return out
 
 
-def _mask_to_yolo_segmentation_lines(mask: np.ndarray, class_map: dict[int, int]) -> list[str]:
+def _mask_to_yolo_segmentation_lines(
+    mask: np.ndarray,
+    class_map: dict[int, int] | None = None,
+    edge_touching_label_ids: set[int] | None = None,
+) -> list[str]:
     lines: list[str] = []
     height, width = mask.shape
-    class_id = class_map.get(1, 0)
+    default_class_id = class_map.get(1, OBJECT_CLASS_ID) if class_map is not None else OBJECT_CLASS_ID
+    edge_touching_label_ids = edge_touching_label_ids or set()
 
     foreground = (mask > 0).astype(np.uint8)
     components = label(foreground, connectivity=1)
 
     for component_id in range(1, int(components.max()) + 1):
-        binary = (components == component_id).astype(np.uint8)
+        component_mask = components == component_id
+        label_ids = {int(v) for v in np.unique(mask[component_mask]) if v != 0}
+        class_id = (
+            EDGE_TOUCHING_CLASS_ID
+            if label_ids.intersection(edge_touching_label_ids)
+            else default_class_id
+        )
+
+        binary = component_mask.astype(np.uint8)
         contours = find_contours(binary, level=0.5)
         for contour in contours:
             if contour.shape[0] < 3:
@@ -375,6 +392,21 @@ def _mask_to_yolo_segmentation_lines(mask: np.ndarray, class_map: dict[int, int]
             lines.append(line)
 
     return lines
+
+
+def _edge_touching_label_ids(mask: np.ndarray) -> set[int]:
+    if mask.size == 0:
+        return set()
+
+    edge_values = np.concatenate(
+        [
+            mask[0, :].ravel(),
+            mask[-1, :].ravel(),
+            mask[:, 0].ravel(),
+            mask[:, -1].ravel(),
+        ]
+    )
+    return {int(v) for v in np.unique(edge_values) if v != 0}
 
 
 def _write_dataset_yaml(dataset_root: Path, class_names: dict[int, str]) -> Path:
