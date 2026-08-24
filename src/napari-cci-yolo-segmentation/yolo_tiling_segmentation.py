@@ -8,6 +8,7 @@ import dask.array as da
 import numpy as np
 import skimage.color
 import skimage.segmentation
+from skimage.measure import label
 
 from . import config
 
@@ -442,6 +443,32 @@ def predict_segments_with_yolo_tiling(
         image_data=_normalize_to_uint8(image_data),
         overlap=overlap,
     )
+
+
+def keep_largest_component_per_label(label_mask) -> np.ndarray:
+    label_mask = np.asarray(label_mask)
+    out = np.zeros(label_mask.shape, dtype=label_mask.dtype)
+
+    for label_id in np.unique(label_mask):
+        if label_id == 0:
+            continue
+
+        components = label(label_mask == label_id, connectivity=1)
+        best_component_id = 0
+        best_area = -1
+        for component_id in range(1, int(components.max()) + 1):
+            ys, xs = np.where(components == component_id)
+            if len(ys) == 0:
+                continue
+
+            bbox_area = (int(ys.max()) - int(ys.min()) + 1) * (int(xs.max()) - int(xs.min()) + 1)
+            if bbox_area > best_area:
+                best_area = bbox_area
+                best_component_id = component_id
+
+        if best_component_id != 0:
+            out[components == best_component_id] = label_id
+    return out
 
 
 def merge_segments_one_pixel_boundary(segment_results, image_size: int = 1024, overlap: int = 100, clear_borders: bool = False):

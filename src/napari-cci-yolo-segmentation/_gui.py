@@ -30,6 +30,7 @@ from ._segmentation_training import (
     run_retraining_pipeline,
 )
 from .yolo_tiling_segmentation import (
+    keep_largest_component_per_label,
     merge_segments_one_pixel_boundary,
     predict_segments_with_yolo_tiling,
 )
@@ -414,6 +415,7 @@ class CciYoloSegmentatorQWidget(QWidget):
             image_size=image_size,
             overlap=overlap,
         )
+        merged_mask = keep_largest_component_per_label(merged_mask)
 
         merge_method = "One pixel boundary"
         layer_name = self._next_merged_layer_name(merge_method)
@@ -996,6 +998,8 @@ class CciYoloSegmentatorQWidget(QWidget):
                 )
                 result = prediction[0] if len(prediction) else None
                 labels_mask = self._result_to_labels_mask(result, image_u8.shape[:2])
+                if labels_mask is not None:
+                    labels_mask = keep_largest_component_per_label(labels_mask)
                 if self.show_bbox and labels_mask is not None:
                     bbox_rects = self._label_mask_to_bbox_rectangles(labels_mask)
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard

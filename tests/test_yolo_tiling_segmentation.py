@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import types
 from pathlib import Path
 import sys
 
@@ -9,13 +10,15 @@ import pytest
 
 
 def _load_tiling_module():
-    module_path = (
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "napari-cci-yolo-segmentation"
-        / "yolo_tiling_segmentation.py"
-    )
-    spec = importlib.util.spec_from_file_location("yolo_tiling_segmentation", module_path)
+    package_name = "napari_cci_yolo_segmentation"
+    package_path = Path(__file__).resolve().parents[1] / "src" / "napari-cci-yolo-segmentation"
+    if package_name not in sys.modules:
+        package = types.ModuleType(package_name)
+        package.__path__ = [str(package_path)]
+        sys.modules[package_name] = package
+
+    module_path = package_path / "yolo_tiling_segmentation.py"
+    spec = importlib.util.spec_from_file_location(f"{package_name}.yolo_tiling_segmentation", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -59,3 +62,21 @@ def test_one_pixel_boundary_merge_links_labels_touching_across_chunks():
     assert np.all(merged[:2, 1:3] == 7)
     assert merged[3, 0] == 3
     assert merged[3, 3] == 4
+
+
+def test_keep_largest_component_per_label_preserves_ids():
+    mod = _load_tiling_module()
+
+    labels = np.zeros((12, 12), dtype=np.uint32)
+    labels[1:4, 1:4] = 4
+    labels[8:9, 8:9] = 4
+    labels[6:8, 2:10] = 9
+    labels[10:11, 1:2] = 9
+
+    filtered = mod.keep_largest_component_per_label(labels)
+
+    assert set(np.unique(filtered)) == {0, 4, 9}
+    assert np.all(filtered[1:4, 1:4] == 4)
+    assert filtered[8, 8] == 0
+    assert np.all(filtered[6:8, 2:10] == 9)
+    assert filtered[10, 1] == 0
