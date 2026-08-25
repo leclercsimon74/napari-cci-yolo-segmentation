@@ -435,7 +435,6 @@ class CciYoloSegmentatorQWidget(QWidget):
             image_size=image_size,
             overlap=overlap,
         )
-        merged_mask = keep_largest_component_per_label(merged_mask)
 
         merge_method = "One pixel boundary"
         layer_name = self._next_merged_layer_name(merge_method)
@@ -928,6 +927,7 @@ class CciYoloSegmentatorQWidget(QWidget):
                 mask_img = mask_img.resize((shape[1], shape[0]), resample=nearest)
                 mask_bool = np.asarray(mask_img) > 0
 
+            mask_bool = keep_largest_component_per_label(mask_bool.astype(np.uint8)) > 0
             update = mask_bool & (confidence >= confidence_map)
             labels[update] = next_label
             confidence_map[update] = confidence
@@ -1118,8 +1118,6 @@ class CciYoloSegmentatorQWidget(QWidget):
                 )
                 result = prediction[0] if len(prediction) else None
                 labels_mask = self._result_to_labels_mask(result, image_u8.shape[:2])
-                if labels_mask is not None:
-                    labels_mask = keep_largest_component_per_label(labels_mask)
                 if self.show_bbox and result is not None:
                     bbox_rects = self._result_to_bbox_predictions(result, image_u8.shape[:2])
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard

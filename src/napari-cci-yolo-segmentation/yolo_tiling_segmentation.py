@@ -151,6 +151,7 @@ class YoloSegmenter:
             )
 
         all_masks = np.zeros(shape=data.shape, dtype=np.uint32)
+        confidence_map = np.full(data.shape, -np.inf, dtype=float)
         if result is None or result[0].masks is None:
             return all_masks
 
@@ -164,16 +165,18 @@ class YoloSegmenter:
 
         sh1 = all_masks.shape[0]
         sh2 = all_masks.shape[1]
+        labels_view = all_masks[:sh1, :sh2]
+        confidences_view = confidence_map[:sh1, :sh2]
 
         for n in range(segments):
             label_id = self.int_gen.get_next()
-            self.label_confidences[label_id] = float(confs[n]) if n < len(confs) else 1.0
-            mask = masks[n].astype(np.uint32) * label_id
-            all_masks[:sh1, :sh2] = np.where(
-                all_masks[:sh1, :sh2] == 0,
-                mask[:sh1, :sh2],
-                all_masks[:sh1, :sh2],
-            )
+            confidence = float(confs[n]) if n < len(confs) else 1.0
+            self.label_confidences[label_id] = confidence
+            mask_bool = keep_largest_component_per_label(masks[n] > 0.5) > 0
+            mask_bool = mask_bool[:sh1, :sh2]
+            update = mask_bool & (confidence >= confidences_view)
+            labels_view[update] = label_id
+            confidences_view[update] = confidence
 
         return all_masks
 
