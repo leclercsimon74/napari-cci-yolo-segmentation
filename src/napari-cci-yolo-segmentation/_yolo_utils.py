@@ -1,6 +1,8 @@
 import shutil
 from pathlib import Path
 
+from . import config
+
 
 def _points_to_yolo_xywh(points: list[tuple[float, float]]) -> tuple[float, float, float, float] | None:
     """Convert normalized polygon points to normalized YOLO xywh box."""
@@ -186,7 +188,10 @@ class CCIYoloWrapper:
         self.model = self._create_model(weights_path)
 
     def predict(self, img):
-        return self.model(img)
+        return self.model(
+            img,
+            device=config.YOLO_DEVICE,
+        )
 
     def train(self, data_set_file: Path, image_size, batch=8, epochs=300, patience=100, ** kwargs):
         data_set_file = Path(data_set_file)
@@ -199,6 +204,7 @@ class CCIYoloWrapper:
                 raise ValueError("Pass either 'batch' or 'batch_size', not both with different values.")
             batch = batch_size
 
+        kwargs.setdefault("device", config.YOLO_DEVICE)
         self.res = self.model.train(data=data_set_file, batch=batch, imgsz=image_size, epochs=epochs, patience=patience, **kwargs)
         return self.res
 

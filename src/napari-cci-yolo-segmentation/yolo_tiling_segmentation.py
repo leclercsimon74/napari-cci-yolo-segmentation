@@ -113,10 +113,13 @@ class YoloSegmenter:
         model_path: str,
         image_size: int,
         iou: float = config.YOLO_IOU,
+        device: str = config.YOLO_DEVICE,
     ):
         self.model_mutex = threading.Lock()
         self.image_size = image_size
         self.iou = iou
+        self.device = device
+        self.label_confidences = {}
         self.int_gen = IntGenerator()
         self.model = self._create_model(model_path)
 
@@ -144,6 +147,7 @@ class YoloSegmenter:
                 retina_masks=True,
                 verbose=False,
                 iou=self.iou,
+                device=self.device,
             )
 
         all_masks = np.zeros(shape=data.shape, dtype=np.uint32)
@@ -153,12 +157,18 @@ class YoloSegmenter:
         result_masks = result[0].masks
         masks = result_masks.data.cpu().numpy()
         segments = result[0].masks.shape[0]
+        confs = np.ones(segments, dtype=float)
+        boxes = getattr(result[0], "boxes", None)
+        if boxes is not None and getattr(boxes, "conf", None) is not None:
+            confs = boxes.conf.cpu().numpy().astype(float)
 
         sh1 = all_masks.shape[0]
         sh2 = all_masks.shape[1]
 
         for n in range(segments):
-            mask = masks[n].astype(np.uint32) * self.int_gen.get_next()
+            label_id = self.int_gen.get_next()
+            self.label_confidences[label_id] = float(confs[n]) if n < len(confs) else 1.0
+            mask = masks[n].astype(np.uint32) * label_id
             all_masks[:sh1, :sh2] = np.where(
                 all_masks[:sh1, :sh2] == 0,
                 mask[:sh1, :sh2],
@@ -418,8 +428,14 @@ def segment_with_yolo_tiling(
     overlap: int = 100,
     clear_borders: bool = False,
     iou: float = config.YOLO_IOU,
+    device: str = config.YOLO_DEVICE,
 ):
-    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
+    yolo_segmenter = YoloSegmenter(
+        model_path=model_path,
+        image_size=image_size,
+        iou=iou,
+        device=device,
+    )
     segmenter = LargeImageYoloSegmenter()
     return segmenter.segment_large_image_data(
         yolo_segmenter=yolo_segmenter,
@@ -435,14 +451,43 @@ def predict_segments_with_yolo_tiling(
     image_size: int = 1024,
     overlap: int = 100,
     iou: float = config.YOLO_IOU,
+    device: str = config.YOLO_DEVICE,
 ):
-    yolo_segmenter = YoloSegmenter(model_path=model_path, image_size=image_size, iou=iou)
+    yolo_segmenter = YoloSegmenter(
+        model_path=model_path,
+        image_size=image_size,
+        iou=iou,
+        device=device,
+    )
     segmenter = LargeImageYoloSegmenter()
     return segmenter.predict_segments(
         yolo_segmenter=yolo_segmenter,
         image_data=_normalize_to_uint8(image_data),
         overlap=overlap,
     )
+
+
+def predict_segments_with_yolo_tiling_and_confidences(
+    image_data,
+    model_path: str,
+    image_size: int = 1024,
+    overlap: int = 100,
+    iou: float = config.YOLO_IOU,
+    device: str = config.YOLO_DEVICE,
+):
+    yolo_segmenter = YoloSegmenter(
+        model_path=model_path,
+        image_size=image_size,
+        iou=iou,
+        device=device,
+    )
+    segmenter = LargeImageYoloSegmenter()
+    label_mask = segmenter.predict_segments(
+        yolo_segmenter=yolo_segmenter,
+        image_data=_normalize_to_uint8(image_data),
+        overlap=overlap,
+    )
+    return label_mask, dict(yolo_segmenter.label_confidences)
 
 
 def keep_largest_component_per_label(label_mask) -> np.ndarray:

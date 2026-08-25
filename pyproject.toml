@@ -25,7 +25,6 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
-    "ultralytics",
     "dask",
 ]
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -32,8 +33,14 @@ from ._segmentation_training import (
 from .yolo_tiling_segmentation import (
     keep_largest_component_per_label,
     merge_segments_one_pixel_boundary,
-    predict_segments_with_yolo_tiling,
+    predict_segments_with_yolo_tiling_and_confidences,
 )
+
+
+@dataclass(frozen=True)
+class BBoxPrediction:
+    rectangle: np.ndarray
+    confidence: float | None = None
 
 
 class _RetrainWorker(QThread):
@@ -162,13 +169,16 @@ class CciYoloSegmentatorQWidget(QWidget):
         row_train.addWidget(self._retrain_button)
 
         self.stats_label = QLabel()
+        self.device_label = QLabel(f"Device: {config.YOLO_DEVICE.upper()}")
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("<b>Model</b>"))
+        layout.addWidget(self.device_label)
         layout.addLayout(row_model)
         layout.addWidget(load_button)
         layout.addWidget(QLabel("<b>Prediction</b>"))
         layout.addWidget(QLabel(f"Tile of {config.TILE_SIZE} pxl with {config.OVERLAP} pxl overlap for large images"))
+        layout.addWidget(QLabel(f"Confidence threshold: {config.YOLO_CONFIDENCE_THRESHOLD:.2f}"))
         layout.addLayout(row_merging)
         layout.addWidget(QLabel("<b>Review</b>"))
         layout.addLayout(row_crop)
@@ -178,12 +188,22 @@ class CciYoloSegmentatorQWidget(QWidget):
         layout.addLayout(row_train)
         layout.addStretch(1)
         self.setLayout(layout)
+        QTimer.singleShot(0, self._show_startup_device_status)
 
     def _show_info(self, text: str) -> None:
         QMessageBox.information(self, "Yolo CCI Segmentator", text)
 
     def _show_error(self, text: str) -> None:
         QMessageBox.critical(self, "Yolo CCI Segmentator", text)
+
+    def _show_startup_device_status(self) -> None:
+        if config.USE_GPU:
+            return
+
+        self._show_info(
+            "GPU is not available to PyTorch. "
+            "YOLO prediction and retraining will run on CPU."
+        )
 
     def _on_browse_model(self) -> None:
         model_dir = QFileDialog.getExistingDirectory(
@@ -428,7 +448,12 @@ class CciYoloSegmentatorQWidget(QWidget):
         merged_layer.metadata["merge_source_layer_name"] = pred_layer.name
         self.napari_viewer.layers.selection.active = merged_layer
         if self.show_bbox:
-            self._add_bbox_layer(self._label_mask_to_bbox_rectangles(merged_mask))
+            label_confidences = self._merged_label_confidences(
+                pred_layer.metadata.get("label_confidences", {}),
+                pred_data,
+                merged_mask,
+            )
+            self._add_bbox_layer(self._label_mask_to_bbox_rectangles(merged_mask, label_confidences))
         self._show_info(f"Merged segments using one-pixel boundary. Created layer: {layer_name}")
 
     def _on_merge_segments(self) -> None:
@@ -892,7 +917,10 @@ class CciYoloSegmentatorQWidget(QWidget):
         if boxes is not None and getattr(boxes, "conf", None) is not None:
             confs = boxes.conf.cpu().numpy().astype(float)
 
+        next_label = 1
         for mask_index, mask_data in enumerate(masks):
+            confidence = float(confs[mask_index]) if mask_index < len(confs) else 1.0
+
             mask_bool = mask_data > 0.5
             if mask_bool.shape != shape:
                 mask_img = Image.fromarray(mask_bool.astype(np.uint8) * 255)
@@ -900,19 +928,66 @@ class CciYoloSegmentatorQWidget(QWidget):
                 mask_img = mask_img.resize((shape[1], shape[0]), resample=nearest)
                 mask_bool = np.asarray(mask_img) > 0
 
-            confidence = float(confs[mask_index]) if mask_index < len(confs) else 1.0
             update = mask_bool & (confidence >= confidence_map)
-            labels[update] = mask_index + 1
+            labels[update] = next_label
             confidence_map[update] = confidence
+            next_label += 1
 
         return labels
 
     @staticmethod
-    def _label_mask_to_bbox_rectangles(label_mask: np.ndarray) -> list[np.ndarray]:
-        rects = []
+    def _result_to_bbox_predictions(result, shape: tuple[int, int]) -> list[BBoxPrediction]:
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or getattr(boxes, "xyxy", None) is None:
+            return []
+
+        xyxy = boxes.xyxy.cpu().numpy().astype(float)
+        confs = np.ones(len(xyxy), dtype=float)
+        if getattr(boxes, "conf", None) is not None:
+            confs = boxes.conf.cpu().numpy().astype(float)
+
+        height, width = shape
+        bbox_predictions = []
+        for box_index, box in enumerate(xyxy):
+            confidence = float(confs[box_index]) if box_index < len(confs) else 1.0
+            if confidence < config.YOLO_CONFIDENCE_THRESHOLD:
+                continue
+
+            x0, y0, x1, y1 = box
+            x0 = max(0.0, min(float(width), x0))
+            x1 = max(0.0, min(float(width), x1))
+            y0 = max(0.0, min(float(height), y0))
+            y1 = max(0.0, min(float(height), y1))
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            rectangle = np.array(
+                [[y0, x0], [y0, x1], [y1, x1], [y1, x0]],
+                dtype=float,
+            )
+            bbox_predictions.append(BBoxPrediction(rectangle, confidence))
+
+        return bbox_predictions
+
+    @staticmethod
+    def _label_mask_to_bbox_rectangles(
+        label_mask: np.ndarray,
+        label_confidences: dict[int, float] | None = None,
+        filter_by_confidence: bool = True,
+    ) -> list[BBoxPrediction]:
+        bbox_predictions = []
         for label_id in np.unique(label_mask):
             if label_id == 0:
                 continue
+            confidence = None
+            if label_confidences is not None:
+                confidence = label_confidences.get(int(label_id))
+                if (
+                    filter_by_confidence
+                    and confidence is not None
+                    and confidence < config.YOLO_CONFIDENCE_THRESHOLD
+                ):
+                    continue
             ys, xs = np.where(label_mask == label_id)
             if len(ys) == 0:
                 continue
@@ -920,26 +995,66 @@ class CciYoloSegmentatorQWidget(QWidget):
             y1 = int(ys.max()) + 1
             x0 = int(xs.min())
             x1 = int(xs.max()) + 1
-            rects.append(np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]], dtype=float))
-        return rects
+            rectangle = np.array(
+                [[y0, x0], [y0, x1], [y1, x1], [y1, x0]],
+                dtype=float,
+            )
+            bbox_predictions.append(BBoxPrediction(rectangle, confidence))
+        return bbox_predictions
 
-    def _add_bbox_layer(self, rects: list[np.ndarray]) -> None:
+    @staticmethod
+    def _merged_label_confidences(
+        source_confidences,
+        source_mask: np.ndarray,
+        merged_mask: np.ndarray,
+    ) -> dict[int, float]:
+        if not source_confidences:
+            return {}
+
+        confidences_by_source_id = {
+            int(label_id): float(confidence)
+            for label_id, confidence in dict(source_confidences).items()
+        }
+        merged_confidences: dict[int, float] = {}
+        for source_id, confidence in confidences_by_source_id.items():
+            merged_ids, counts = np.unique(merged_mask[source_mask == source_id], return_counts=True)
+            candidates = [(int(label_id), int(count)) for label_id, count in zip(merged_ids, counts) if label_id != 0]
+            if not candidates:
+                continue
+            merged_id = max(candidates, key=lambda item: item[1])[0]
+            merged_confidences[merged_id] = max(confidence, merged_confidences.get(merged_id, 0.0))
+
+        return merged_confidences
+
+    def _add_bbox_layer(self, bbox_predictions: list[BBoxPrediction]) -> None:
         existing = self._get_layer_by_name(self.BBOX_LAYER_NAME)
         if existing is not None:
             self.napari_viewer.layers.remove(existing)
 
-        if not rects:
+        if not bbox_predictions:
             return
 
+        confidence_labels = [
+            "" if bbox.confidence is None else f"{bbox.confidence:.2f}"
+            for bbox in bbox_predictions
+        ]
         layer = self.napari_viewer.add_shapes(
-            rects,
+            [bbox.rectangle for bbox in bbox_predictions],
             name=self.BBOX_LAYER_NAME,
             shape_type="rectangle",
             edge_width=2,
             edge_color="cyan",
             face_color="transparent",
+            features={"confidence": confidence_labels},
+            text={
+                "string": "{confidence}",
+                "size": 10,
+                "color": "cyan",
+                "anchor": "upper_left",
+            },
         )
         layer.metadata["prediction_role"] = "bbox_reference"
+        layer.metadata["confidence_threshold"] = config.YOLO_CONFIDENCE_THRESHOLD
 
     def _on_predict(self) -> None:
         if self._yolo is None:
@@ -977,15 +1092,20 @@ class CciYoloSegmentatorQWidget(QWidget):
                     return
 
                 image_gray = self._to_grayscale(image_u8)
-                tiled_mask = predict_segments_with_yolo_tiling(
+                tiled_mask, tiled_confidences = predict_segments_with_yolo_tiling_and_confidences(
                     image_data=image_gray,
                     model_path=str(self._model_path),
                     image_size=tile_size,
                     overlap=overlap,
                     iou=config.YOLO_IOU,
+                    device=config.YOLO_DEVICE,
                 )
                 if self.show_bbox:
-                    bbox_rects = self._label_mask_to_bbox_rectangles(tiled_mask)
+                    bbox_rects = self._label_mask_to_bbox_rectangles(
+                        tiled_mask,
+                        tiled_confidences,
+                        filter_by_confidence=False,
+                    )
                 result = None
             else:
                 image_rgb = self._to_pil_rgb(image_u8)
@@ -1000,8 +1120,8 @@ class CciYoloSegmentatorQWidget(QWidget):
                 labels_mask = self._result_to_labels_mask(result, image_u8.shape[:2])
                 if labels_mask is not None:
                     labels_mask = keep_largest_component_per_label(labels_mask)
-                if self.show_bbox and labels_mask is not None:
-                    bbox_rects = self._label_mask_to_bbox_rectangles(labels_mask)
+                if self.show_bbox and result is not None:
+                    bbox_rects = self._result_to_bbox_predictions(result, image_u8.shape[:2])
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - GUI runtime guard
             self._show_error(f"Prediction failed: {exc}")
             return
@@ -1018,6 +1138,7 @@ class CciYoloSegmentatorQWidget(QWidget):
             )
             pred_layer.metadata["prediction_mode"] = "single_image"
             pred_layer.metadata["yolo_iou_threshold"] = config.YOLO_IOU
+            pred_layer.metadata["confidence_threshold"] = config.YOLO_CONFIDENCE_THRESHOLD
             self._show_info(f"Prediction done: {int(labels_mask.max())} segment(s).")
             return
 
@@ -1030,6 +1151,8 @@ class CciYoloSegmentatorQWidget(QWidget):
             pred_layer.metadata["tile_size"] = tile_size
             pred_layer.metadata["overlap"] = overlap
             pred_layer.metadata["chunk_size"] = tile_size - (2 * overlap)
+            pred_layer.metadata["label_confidences"] = tiled_confidences
+            pred_layer.metadata["confidence_threshold"] = config.YOLO_CONFIDENCE_THRESHOLD
             self._add_tile_grid_layer(tiled_mask.shape, tile_size, overlap)
             self._show_info(
                 "Large image prediction done. "

@@ -19,6 +19,15 @@ OBJECT_CLASS_ID = 0
 EDGE_TOUCHING_CLASS_ID = 1
 
 
+def _default_yolo_device() -> str:
+    try:
+        from . import config
+    except ImportError:
+        return "cpu"
+
+    return config.YOLO_DEVICE
+
+
 class CCIYoloWrapper:
     """Small wrapper used by the widget for predict/train calls."""
 
@@ -47,6 +56,7 @@ class CCIYoloWrapper:
         return str(task) if task is not None else "unknown"
 
     def predict(self, img, **kwargs):
+        kwargs.setdefault("device", _default_yolo_device())
         return self.model.predict(source=img, **kwargs)
 
     def train(
@@ -58,6 +68,7 @@ class CCIYoloWrapper:
         patience: int = 30,
         **kwargs,
     ):
+        kwargs.setdefault("device", _default_yolo_device())
         return self.model.train(
             data=str(data_set_file),
             imgsz=image_size,
