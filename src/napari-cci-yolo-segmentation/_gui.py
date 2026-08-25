@@ -169,6 +169,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         row_train.addWidget(self._retrain_button)
 
         self.stats_label = QLabel()
+        self.inference_stats_label = QLabel("Inference scores: no prediction yet.")
         self.device_label = QLabel(f"Device: {config.YOLO_DEVICE.upper()}")
 
         layout = QVBoxLayout()
@@ -179,6 +180,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         layout.addWidget(QLabel("<b>Prediction</b>"))
         layout.addWidget(QLabel(f"Tile of {config.TILE_SIZE} pxl with {config.OVERLAP} pxl overlap for large images"))
         layout.addWidget(QLabel(f"Confidence threshold: {config.YOLO_CONFIDENCE_THRESHOLD:.2f}"))
+        layout.addWidget(self.inference_stats_label)
         layout.addLayout(row_merging)
         layout.addWidget(QLabel("<b>Review</b>"))
         layout.addLayout(row_crop)
@@ -970,6 +972,45 @@ class CciYoloSegmentatorQWidget(QWidget):
         return bbox_predictions
 
     @staticmethod
+    def _result_confidences(result) -> list[float]:
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or getattr(boxes, "conf", None) is None:
+            return []
+
+        return [float(confidence) for confidence in boxes.conf.cpu().numpy().astype(float)]
+
+    @staticmethod
+    def _confidence_threshold_coverage(confidences) -> dict[str, float] | None:
+        values = np.asarray(list(confidences), dtype=float)
+        if values.size == 0:
+            return None
+
+        thresholds = (0.95, 0.75, 0.5)
+        return {
+            f"{threshold:g}": float(np.mean(values >= threshold) * 100.0)
+            for threshold in thresholds
+        }
+
+    @staticmethod
+    def _format_confidence_summary(confidences: list[float]) -> str:
+        coverage = CciYoloSegmentatorQWidget._confidence_threshold_coverage(confidences)
+        if coverage is None:
+            return "Conf. Thr (0): no detections"
+
+        return (
+            f"Conf. Thr ({len(confidences)}): "
+            f"0.95:{coverage['0.95']:.0f}%, "
+            f"0.75:{coverage['0.75']:.0f}%, "
+            f"0.5:{coverage['0.5']:.0f}%"
+        )
+
+    def _set_inference_stats(self, confidences) -> dict[str, float] | None:
+        confidences = list(confidences)
+        summary = self._format_confidence_summary(confidences)
+        self.inference_stats_label.setText(summary)
+        return self._confidence_threshold_coverage(confidences)
+
+    @staticmethod
     def _label_mask_to_bbox_rectangles(
         label_mask: np.ndarray,
         label_confidences: dict[int, float] | None = None,
@@ -1076,8 +1117,11 @@ class CciYoloSegmentatorQWidget(QWidget):
 
         image_u8 = self._normalize_to_uint8(image_data)
         tiled_mask = None
+        tiled_confidences = {}
         labels_mask = None
         bbox_rects = []
+        detection_confidences = []
+        confidence_threshold_coverage = None
         tile_size = self.TILING_THRESHOLD
         overlap = config.OVERLAP
         if overlap * 2 >= tile_size:
@@ -1106,6 +1150,7 @@ class CciYoloSegmentatorQWidget(QWidget):
                         tiled_confidences,
                         filter_by_confidence=False,
                     )
+                detection_confidences = list(tiled_confidences.values())
                 result = None
             else:
                 image_rgb = self._to_pil_rgb(image_u8)
@@ -1117,6 +1162,7 @@ class CciYoloSegmentatorQWidget(QWidget):
                     iou=config.YOLO_IOU,
                 )
                 result = prediction[0] if len(prediction) else None
+                detection_confidences = self._result_confidences(result)
                 labels_mask = self._result_to_labels_mask(result, image_u8.shape[:2])
                 if self.show_bbox and result is not None:
                     bbox_rects = self._result_to_bbox_predictions(result, image_u8.shape[:2])
@@ -1128,6 +1174,7 @@ class CciYoloSegmentatorQWidget(QWidget):
         if existing is not None:
             self.napari_viewer.layers.remove(existing)
         self._add_bbox_layer(bbox_rects)
+        confidence_threshold_coverage = self._set_inference_stats(detection_confidences)
 
         if labels_mask is not None:
             pred_layer = self.napari_viewer.add_labels(
@@ -1137,7 +1184,11 @@ class CciYoloSegmentatorQWidget(QWidget):
             pred_layer.metadata["prediction_mode"] = "single_image"
             pred_layer.metadata["yolo_iou_threshold"] = config.YOLO_IOU
             pred_layer.metadata["confidence_threshold"] = config.YOLO_CONFIDENCE_THRESHOLD
-            self._show_info(f"Prediction done: {int(labels_mask.max())} segment(s).")
+            pred_layer.metadata["detection_score_threshold_coverage"] = confidence_threshold_coverage
+            self._show_info(
+                f"Prediction done: {int(labels_mask.max())} segment(s).\n"
+                f"{self.inference_stats_label.text()}"
+            )
             return
 
         if result is None and tiled_mask is not None:
@@ -1151,14 +1202,19 @@ class CciYoloSegmentatorQWidget(QWidget):
             pred_layer.metadata["chunk_size"] = tile_size - (2 * overlap)
             pred_layer.metadata["label_confidences"] = tiled_confidences
             pred_layer.metadata["confidence_threshold"] = config.YOLO_CONFIDENCE_THRESHOLD
+            pred_layer.metadata["detection_score_threshold_coverage"] = confidence_threshold_coverage
             self._add_tile_grid_layer(tiled_mask.shape, tile_size, overlap)
             self._show_info(
                 "Large image prediction done. "
-                "Use Merge Segments to merge labels across tile boundaries."
+                "Use Merge Segments to merge labels across tile boundaries.\n"
+                f"{self.inference_stats_label.text()}"
             )
             return
 
-        self._show_info(f"Prediction done: no segmentation masks, {len(bbox_rects)} bbox fallback(s).")
+        self._show_info(
+            f"Prediction done: no segmentation masks, {len(bbox_rects)} bbox fallback(s).\n"
+            f"{self.inference_stats_label.text()}"
+        )
 
     def _on_retrain(self) -> None:
         if self._yolo is None or self._model_path is None:
